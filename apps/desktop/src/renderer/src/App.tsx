@@ -7,6 +7,7 @@ import History from './components/History'
 import type { JobItem } from './hooks/useJobs'
 import Team from './components/Team'
 import CreationCenter from './components/CreationCenter'
+import StoryboardEditor from './components/StoryboardEditor'
 import TitleBar from './components/TitleBar'
 import WelcomeBanner from './components/WelcomeBanner'
 import { EmptyState } from './components/EmptyState'
@@ -47,7 +48,7 @@ import {
 } from './components/icons'
 import desktopPackage from '../../../package.json'
 
-type TabId = 'dispatch' | 'providers' | 'creation' | 'history' | 'team'
+type TabId = 'dispatch' | 'providers' | 'creation' | 'history' | 'team' | 'storyboard'
 
 function readStoredViewScope(hasTeam: boolean): ViewScope {
   const stored = localStorage.getItem('qf-view-scope')
@@ -98,6 +99,7 @@ const TABS: TabDef[] = [
   { id: 'dispatch', label: '调度台', icon: IconGrid },
   { id: 'providers', label: '厂商', icon: IconMonitor },
   { id: 'creation', label: '创作中心', icon: IconSparkles },
+  { id: 'storyboard', label: '分镜编排', icon: IconGrid },
   { id: 'history', label: '历史', icon: IconClock },
   { id: 'team', label: '团队', icon: IconUsers }
 ]
@@ -153,7 +155,7 @@ function MainApp({
   const [tab, setTab] = useState<TabId>(() => {
     const hit = location.hash.match(/#tab=(.+)/)
     const t = hit ? hit[1] : 'dispatch'
-    return (['dispatch', 'providers', 'creation', 'history', 'team'] as TabId[]).includes(t as TabId)
+    return (['dispatch', 'providers', 'creation', 'history', 'team', 'storyboard'] as TabId[]).includes(t as TabId)
       ? (t as TabId)
       : 'dispatch'
   })
@@ -548,6 +550,9 @@ function MainApp({
           </div>
           <div className="tab-pane" style={{ display: resolvedTab === 'history' ? 'flex' : 'none' }}>
             <History jobs={jobs} features={permissions.features} onRegenerate={handleRegenerate} />
+          </div>
+          <div className="tab-pane" style={{ display: resolvedTab === 'storyboard' ? 'flex' : 'none' }}>
+            <StoryboardEditor user={user} onToast={showToast} />
           </div>
           <div className="tab-pane" style={{ display: resolvedTab === 'team' ? 'flex' : 'none' }}>
             <Team

@@ -9,6 +9,7 @@ export const DESKTOP_FEATURE_KEYS = [
   'tab.history',
   'tab.team',
   'tab.creation',
+  'tab.storyboard',
   'dispatch.text2video',
   'dispatch.img2video',
   'dispatch.multi_ref',

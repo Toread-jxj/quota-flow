@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electron'
-import { createReadStream, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { copyFileSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { join, resolve } from 'node:path'
 import type { AddressInfo } from 'node:net'
@@ -15,6 +15,9 @@ import {
 } from './updater'
 import { runGenerate } from './dispatch'
 import type { DispatchEvent, QuotaUpdatedPayload } from './dispatch'
+import { initApiServer, setApiContext } from './api-server'
+import { parseStoryboardText, matchAssets, mergeVideos, shotFileName, findStoryboardFiles } from './storyboard'
+import type { ApiContext } from './api-server'
 import type { UpdaterStatus } from './updater'
 import { getWatermarkStatus, processWatermarkJob } from './watermark-remover/job'
 import type { WatermarkJobInput } from './watermark-remover/job'
@@ -486,6 +489,14 @@ app.whenReady().then(() => {
     isGenerating = true
     pendingCancel = false
     lastDispatchCtx = { supabaseUrl: input.supabaseUrl, supabaseAnonKey: input.supabaseAnonKey, userId: input.userId }
+    // 顺带把上下文缓存给 HTTP API server，外部系统即可通过 /v1/generate 复用同一登录态/账号
+    setApiContext({
+      supabaseUrl: input.supabaseUrl,
+      supabaseAnonKey: input.supabaseAnonKey,
+      accessToken: input.accessToken,
+      refreshToken: input.refreshToken,
+      userId: input.userId
+    })
     try {
       return await runGenerate(input, emit, (jobId, state) => {
         registeredJobId = jobId
@@ -673,6 +684,86 @@ app.whenReady().then(() => {
   initProviders()
   registerApiIpc()
   initCookieRenew()
+
+  // 对外 HTTP API：上下文由渲染层登录后注入，或由 dispatch:generate 顺带缓存
+  ipcMain.handle('api-server:configure', (_e, cfg: unknown) => {
+    const c = (cfg ?? {}) as Partial<ApiContext>
+    setApiContext({
+      supabaseUrl: typeof c.supabaseUrl === 'string' ? c.supabaseUrl : undefined,
+      supabaseAnonKey: typeof c.supabaseAnonKey === 'string' ? c.supabaseAnonKey : undefined,
+      accessToken: typeof c.accessToken === 'string' ? c.accessToken : undefined,
+      refreshToken: typeof c.refreshToken === 'string' ? c.refreshToken : undefined,
+      userId: typeof c.userId === 'string' ? c.userId : undefined
+    })
+    return { ok: true }
+  })
+  initApiServer()
+
+  // ---- 分镜编排 IPC（默认 raw 照抄，不做语义转换；核心是资源自动匹配）----
+  ipcMain.handle('storyboard:pick-dir', async () => {
+    const r = await dialog.showOpenDialog({ properties: ['openDirectory'] })
+    if (r.canceled || r.filePaths.length === 0) return { canceled: true }
+    return { canceled: false, dir: r.filePaths[0] }
+  })
+
+  ipcMain.handle('storyboard:parse', async (_e, params: { textPath?: string; workDir: string }) => {
+    try {
+      let textPath = params.textPath
+      if (!textPath) {
+        const mdFiles = await findStoryboardFiles(params.workDir)
+        if (mdFiles.length === 0) return { ok: false, error: '工作目录里没有找到分镜文本（.md 文件）' }
+        textPath = mdFiles[0]
+      }
+      const text = readFileSync(textPath, 'utf8')
+      const shots = parseStoryboardText(text)
+      // 资源自动匹配：@引用 → 工作目录下扫描到的图片绝对路径
+      for (const shot of shots) {
+        shot.images = await matchAssets(shot.refs, params.workDir)
+      }
+      const batchId = (textPath.split(/[\\/]/).pop() || 'storyboard').replace(/\.[^.]+$/, '')
+      const batchDir = join(app.getPath('userData'), 'storyboard', batchId)
+      mkdirSync(batchDir, { recursive: true })
+      return { ok: true, result: { batchId, provider: 'doubao', textPath, batchDir, shots } }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  ipcMain.handle(
+    'storyboard:generate',
+    async (_e, params: { gen: Parameters<typeof runGenerate>[0]; batchDir: string; index: number }) => {
+      try {
+        const result = await runGenerate(params.gen, () => {}, undefined, undefined)
+        if (!result.ok || !result.jobId) return { ok: false, error: result.error || '生成失败' }
+        const src = join(app.getPath('userData'), 'videos', `${result.jobId}.mp4`)
+        if (!existsSync(src)) return { ok: false, error: '视频未落盘（可能下载失败）' }
+        const shotsDir = join(params.batchDir, 'shots')
+        mkdirSync(shotsDir, { recursive: true })
+        const dst = join(shotsDir, shotFileName(params.index))
+        copyFileSync(src, dst)
+        return { ok: true, videoPath: dst }
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) }
+      }
+    }
+  )
+
+  ipcMain.handle('storyboard:merge', async (_e, params: { batchDir: string }) => {
+    try {
+      const shotsDir = join(params.batchDir, 'shots')
+      const files = readdirSync(shotsDir).filter((f) => /^shot_\d+\.mp4$/.test(f))
+      files.sort((a, b) => parseInt(a.match(/\d+/)![0], 10) - parseInt(b.match(/\d+/)![0], 10))
+      if (files.length === 0) return { ok: false, error: '没有已生成的片段' }
+      const mergedDir = join(params.batchDir, 'merged')
+      mkdirSync(mergedDir, { recursive: true })
+      const finalPath = join(mergedDir, 'final.mp4')
+      await mergeVideos(files.map((f) => join(shotsDir, f)), finalPath)
+      return { ok: true, output: finalPath }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
   createWindow()
 
   app.on('activate', () => {

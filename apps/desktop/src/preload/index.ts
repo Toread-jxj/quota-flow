@@ -223,6 +223,32 @@ export interface GenerateRequest {
   showWebview?: boolean
 }
 
+export interface StoryboardDialogue {
+  role: string
+  line: string
+}
+
+export interface StoryboardShot {
+  index: number
+  id: string
+  title: string
+  durationSec: number
+  scene: string
+  actions: string[]
+  dialogue: StoryboardDialogue[]
+  refs: string[]
+  images: string[]
+  prompt: string
+}
+
+export interface StoryboardParseResult {
+  batchId: string
+  provider: string
+  textPath: string
+  batchDir: string
+  shots: StoryboardShot[]
+}
+
 export interface DesktopApi {
   versions: {
     electron: string
@@ -478,6 +504,12 @@ export interface DesktopApi {
     ) => Promise<{ ok: boolean; videoUrl?: string; posterUrl?: string; error?: string }>
     onEvent: (callback: (event: WebviewTestEvent) => void) => () => void
   }
+  storyboard: {
+    pickDir: () => Promise<{ canceled: boolean; dir?: string }>
+    parse: (params: { textPath?: string; workDir: string }) => Promise<{ ok: boolean; result?: StoryboardParseResult; error?: string }>
+    generate: (params: { gen: GenerateRequest; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
+    merge: (params: { batchDir: string }) => Promise<{ ok: boolean; output?: string; error?: string }>
+  }
 }
 
 const api: DesktopApi = {
@@ -704,6 +736,12 @@ const api: DesktopApi = {
         ipcRenderer.removeListener('webview-test:event', listener)
       }
     }
+  },
+  storyboard: {
+    pickDir: () => ipcRenderer.invoke('storyboard:pick-dir'),
+    parse: (params) => ipcRenderer.invoke('storyboard:parse', params),
+    generate: (params) => ipcRenderer.invoke('storyboard:generate', params),
+    merge: (params) => ipcRenderer.invoke('storyboard:merge', params)
   },
 }
 

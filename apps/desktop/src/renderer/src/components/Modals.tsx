@@ -58,15 +58,13 @@ export function getInitialFontSize(): FontSize {
   return '13'
 }
 
-const IS_DEV = import.meta.env.DEV
-
-/** 调试开关：仅开发模式可设置，生成时是否显示厂商 WebView 窗口（默认隐藏，本地缓存） */
+/** 是否显示厂商 WebView 窗口（默认显示，本地缓存；可在设置里切回隐藏） */
 export function applyShowWebview(show: boolean): void {
   localStorage.setItem('qf-show-webview', show ? '1' : '0')
 }
 
 export function getInitialShowWebview(): boolean {
-  return IS_DEV && localStorage.getItem('qf-show-webview') === '1'
+  return localStorage.getItem('qf-show-webview') !== '0'
 }
 
 export function getInitialHealthFreq(): HealthFreq {
@@ -268,19 +266,17 @@ export function SettingsModal({ onClose, updater }: { onClose: () => void; updat
           ]}
         />
       </div>
-      {IS_DEV && (
-        <div className="form-group">
-          <label>调试：显示厂商窗口</label>
-          <Select
-            value={showWebview ? '1' : '0'}
-            onChange={(v) => handleShowWebviewChange(v === '1')}
-            options={[
-              { value: '0', label: '隐藏（默认）' },
-              { value: '1', label: '显示（测试用）' }
-            ]}
-          />
-        </div>
-      )}
+      <div className="form-group">
+        <label>显示厂商窗口（生成时弹出豆包页面）</label>
+        <Select
+          value={showWebview ? '1' : '0'}
+          onChange={(v) => handleShowWebviewChange(v === '1')}
+          options={[
+            { value: '1', label: '显示（默认）' },
+            { value: '0', label: '隐藏' }
+          ]}
+        />
+      </div>
       <div className="form-group">
         <label>调度策略</label>
         <Select

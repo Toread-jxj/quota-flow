@@ -103,6 +103,23 @@ function providerLabel(providerId: string): string {
   return '豆包'
 }
 
+/** 提取错误信息：兼容 Error、supabase PostgrestError（普通对象含 message）、以及其他任意值。
+ * 旧写法 `errMsg(e)` 会把 supabase 的 error 对象显示成 "[object Object]"，
+ * 吞掉真正的 message（如 fetch failed / 401），排查困难。 */
+function errMsg(e: unknown): string {
+  if (e instanceof Error) return e.message
+  if (e && typeof e === 'object') {
+    const msg = (e as { message?: unknown }).message
+    if (typeof msg === 'string' && msg) return msg
+    try {
+      return JSON.stringify(e)
+    } catch {
+      /* fallthrough */
+    }
+  }
+  return String(e)
+}
+
 function parseSupportedDurations(meta: { capabilities?: Record<string, unknown> | null } | undefined): number[] {
   const raw = meta?.capabilities?.supported_durations
   if (!Array.isArray(raw)) return [...DEFAULT_SUPPORTED_DURATIONS]
@@ -256,13 +273,13 @@ export function downloadVideo(
           renameSync(tmp, file)
           finish(true, file)
         } catch (e) {
-          finish(false, null, `写入文件失败：${e instanceof Error ? e.message : String(e)}`)
+          finish(false, null, `写入文件失败：${errMsg(e)}`)
         }
       } else {
         finish(false, null, `下载内容过小（${size} 字节，可能非视频或空响应）`)
       }
     })
-    out.on('error', (e) => finish(false, null, `写文件错误：${e instanceof Error ? e.message : String(e)}`))
+    out.on('error', (e) => finish(false, null, `写文件错误：${errMsg(e)}`))
   })
 }
 
@@ -375,7 +392,8 @@ export async function runGenerate(
       return { ok: false, error: `当前厂商不支持 ${input.durationSec} 秒` }
     }
   } catch (e) {
-    return { ok: false, error: '校验厂商时长失败: ' + (e instanceof Error ? e.message : String(e)) }
+    console.error('[dispatch] 校验厂商时长失败（查 providers 表）:', e)
+    return { ok: false, error: '校验厂商时长失败: ' + errMsg(e) }
   }
   // 取消/已提交状态：由主进程注册表持有引用，IPC 侧可标记 aborted，引擎提交后置 submitted
   const runCancelState: { aborted: boolean; submitted: boolean } = { aborted: false, submitted: false }
@@ -392,7 +410,7 @@ export async function runGenerate(
       providerId: input.providerId
     })
   } catch (e) {
-    return { ok: false, error: '创建任务失败: ' + (e instanceof Error ? e.message : String(e)) }
+    return { ok: false, error: '创建任务失败: ' + (errMsg(e)) }
   }
   if (!job) return { ok: false, error: '创建任务失败' }
   emit({ jobId: job.id, status: 'pending', message: '任务已创建' })
@@ -640,7 +658,7 @@ export async function runGenerate(
         })
       }
     } catch (e) {
-      lastError = '选号/执行异常: ' + (e instanceof Error ? e.message : String(e))
+      lastError = '选号/执行异常: ' + (errMsg(e))
     }
   }
 
@@ -669,11 +687,11 @@ export async function runGenerate(
       downloadError = r
     })
   } catch (e) {
-    downloadError = e instanceof Error ? e.message : String(e)
+    downloadError = errMsg(e)
     emit({
       jobId: job.id,
       status: 'running',
-      message: '视频下载异常，继续使用远程 URL: ' + (e instanceof Error ? e.message : String(e))
+      message: '视频下载异常，继续使用远程 URL: ' + (errMsg(e))
     })
   }
   const resultUrl = localPath || result.videoUrl
@@ -708,10 +726,10 @@ export async function runGenerate(
     }
     if (consumed) onQuotaUpdated?.({ userId: input.userId, ledger: consumed })
   } catch (e) {
-    const errMsg = '额度扣减失败: ' + (e instanceof Error ? e.message : String(e))
+    const quotaErr = '额度扣减失败: ' + errMsg(e)
     await jobSvc.updateJob(input.userId, job.id, {
       status: 'failed',
-      error: errMsg,
+      error: quotaErr,
       resultUrl,
       costUnit,
       costAmount: cost,
@@ -731,8 +749,8 @@ export async function runGenerate(
       },
       completedAt: new Date().toISOString()
     })
-    emit({ jobId: job.id, status: 'failed', message: errMsg })
-    return { ok: false, jobId: job.id, error: errMsg, accountId: selectedKey?.id ?? null }
+    emit({ jobId: job.id, status: 'failed', message: quotaErr })
+    return { ok: false, jobId: job.id, error: quotaErr, accountId: selectedKey?.id ?? null }
   }
 
   await jobSvc.updateJob(input.userId, job.id, {
@@ -812,7 +830,7 @@ async function runApiBranch(
       providerId: input.providerId
     })
   } catch (e) {
-    return { ok: false, error: '创建任务失败: ' + (e instanceof Error ? e.message : String(e)) }
+    return { ok: false, error: '创建任务失败: ' + (errMsg(e)) }
   }
   if (!job) return { ok: false, error: '创建任务失败' }
   emit({ jobId: job.id, status: 'pending', message: '任务已创建' })

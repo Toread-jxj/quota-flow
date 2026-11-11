@@ -11,9 +11,9 @@
     "start": "electron-vite preview",
     "build": "electron-vite build",
     "typecheck": "tsc --noEmit",
-    "release": "pnpm run build && electron-builder --win",
-    "release:publish": "git fetch --tags origin && pnpm run build && electron-builder --win --publish always",
-    "release:win": "pnpm run build && electron-builder --win --publish always",
+    "release": "pnpm run build && electron-builder --win zip",
+    "release:publish": "git fetch --tags origin && pnpm run build && electron-builder --win zip --publish always",
+    "release:win": "pnpm run build && electron-builder --win zip --publish always",
     "release:mac": "pnpm run build && electron-builder --mac --publish always",
     "release:linux": "pnpm run build && electron-builder --linux --publish always",
     "release:dir": "pnpm run build && electron-builder --dir"

@@ -28,13 +28,12 @@ electronLanguages:
   - en-US
 win:
   icon: build/icon.ico
+  artifactName: Quota-Flow-0.2.8-win.${ext}
   target:
-    - target: nsis
+    - target: zip
       arch:
         - x64
-    - target: portable
-      arch:
-        - x64
+  # 固定输出 Quota-Flow-0.2.8-win.zip；不生成 Setup/Portable 变体。
 mac:
   icon: build/icon.png
   category: public.app-category.utilities

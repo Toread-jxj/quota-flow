@@ -723,6 +723,14 @@ const DISPLAY_NAME_SCRIPT = `(() => {
   const cand = [];
   const push = (s) => { const t = norm(s); if (t) cand.push(t); };
   try {
+    const menu = document.querySelector('[data-sidebar-footer-account-menu="true"], [data-sidebar-footer-account-menu]');
+    if (menu) { menu.querySelectorAll('span').forEach((s) => push(s.textContent || '')); }
+  } catch {}
+  try {
+    const av = document.querySelector('[data-testid="chat_header_avatar_button"]');
+    if (av && av.parentElement) { av.parentElement.querySelectorAll('span').forEach((s) => push(s.textContent || '')); }
+  } catch {}
+  try {
     const imgs = document.querySelectorAll('img');
     for (const img of imgs) {
       const cls = (img.getAttribute('class') || '') + ' ' + (img.src || '');

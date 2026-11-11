@@ -1,17 +1,19 @@
 // 分镜编排后端模块：分镜文本解析 + 资产匹配 + 视频合并
 // 默认 raw 照抄（不检测、不润色），让用户在 GUI 里直接 review 分镜词。
 //
-// 解析器规则（通用版，不再硬编码某个项目的资产前缀）：
-//   - 段标题兼容「## V001｜00:00–00:15｜标题」（时码中置）与「## V001｜标题｜全片00:00—00:15」（时码后置）
-//   - 资产引用 @前缀_… 前缀不限定（BT_/DK_/任意），到中文标点/空白/竖线为止
-//   - 动作字段兼容「主要动作」（新版）与「画内主体及动作」（旧版）
-//   - 对白兼容「第001句｜…｜ROLE｜源Sxx-Dxx：台词」（新版）与「D001｜…｜ROLE｜镜头N + 弯引号台词」（旧版）
+// 解析器规则（通用版，只依赖分镜词的「结构共性」，不硬编码某个项目的写法）：
+//   从 BT（旧）与 DK（新）两套分镜词提炼的稳定结构：
+//   - 分段标题  ## Vxxx｜…          （段号字母+数字）
+//   - 栏目      【栏目名[｜补充]】    （稳定）
+//   - 资产引用  @标识符              （前缀项目相关，不锁）
+//   - 镜头      【…镜头N…｜时码】     （「镜头」稳定，「固定」是修饰）
+//   - 对白      ｜ROLE｜ + 台词      （竖线角色 + 弯引号/冒号后台词）
+//   - 动作      镜头块内「动作：」字段
 //   - 破折号 em-dash / en-dash / 连字符 全部兼容
 
 import { readdir, writeFile, rm } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
 import { execFile } from 'node:child_process'
-import { join, basename, extname } from 'node:path'
+import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { resolveFfmpegPath } from './watermark-remover/engine'
 
@@ -94,6 +96,37 @@ function friendlyLabel(stem: string): string {
 interface ParsedLens { no: number; dur: number; action: string }
 interface ParsedDial { role: string; shot: number; line: string }
 
+/**
+ * 提取对白：不依赖编号格式（D001 / 第001句 都行）。
+ * 共性：对白在含「对白」的栏目里，角色名是竖线包围的英文标识符，
+ *       台词要么在后续弯引号「“…”」里（旧），要么在该行冒号后（新）。
+ */
+function extractDialogues(body: string): ParsedDial[] {
+  const cLayer = body.match(/【[^】]*对白[^】]*】([\s\S]*?)(?=【)/)
+  const text = cLayer ? cLayer[1] : ''
+  const dials: ParsedDial[] = []
+  const seen = new Set<string>()
+  const roleRe = /｜([A-Za-z][A-Za-z0-9_-]*)｜/g
+  let m
+  while ((m = roleRe.exec(text)) !== null) {
+    const role = m[1]
+    if (/^(NIGHT|DAWN|DAY|MORNING|AM|PM)$/i.test(role)) continue
+    const after = text.slice(m.index + m[0].length, m.index + m[0].length + 400)
+    let line = ''
+    const q = after.match(/\u201c([^\u201d]+)\u201d/)
+    if (q) line = q[1].trim()
+    else {
+      const c = after.match(/[：:]\s*([^\n]*)/)
+      if (c && /[A-Za-z]/.test(c[1])) line = c[1].trim()
+    }
+    if (line && !seen.has(role + '|' + line)) {
+      seen.add(role + '|' + line)
+      dials.push({ role, shot: 0, line })
+    }
+  }
+  return dials
+}
+
 function parseSegment(body: string): {
   scene: string
   shots: ParsedLens[]
@@ -102,43 +135,27 @@ function parseSegment(body: string): {
 } {
   const scene = stripRefs(grab(body, '场景')).split('。')[0]
 
-  const shotBlocks =
-    body.match(
-      new RegExp(`【固定镜头\\d+｜[\\d.]+${DASH}[\\d.]+秒】[\\s\\S]*?(?=【固定镜头|【C层|【末帧|【本段)`, 'g')
-    ) || []
+  // 镜头：任何含「镜头」的【标题】+ 后续内容（到下一个【为止）。
   const shots: ParsedLens[] = []
-  for (const b of shotBlocks) {
-    const hd = b.match(new RegExp(`【固定镜头(\\d+)｜([\\d.]+)${DASH}([\\d.]+)秒】`))
-    const no = hd ? parseInt(hd[1], 10) : shots.length + 1
-    const dur = hd ? parseFloat(hd[3]) - parseFloat(hd[2]) : 5
-    const act =
-      b.match(/主要动作[：:]\s*([\s\S]*?)(?=[。]?表演触发|[。]?对白覆盖|$)/) ||
-      b.match(/画内主体及动作[：:]\s*([\s\S]*?)(?=[。]?对白对应|$)/)
-    shots.push({ no, dur, action: act ? act[1].trim().replace(/。$/, '') : '' })
+  const headRe = /【([^】]*镜头[^】]*)】/g
+  const heads: { index: number; len: number; head: string }[] = []
+  let hm
+  while ((hm = headRe.exec(body)) !== null) heads.push({ index: hm.index, len: hm[0].length, head: hm[1] })
+  for (let i = 0; i < heads.length; i++) {
+    const from = heads[i].index + heads[i].len
+    const end = i + 1 < heads.length ? heads[i + 1].index : body.length
+    let content = body.slice(from, end)
+    const cut = content.indexOf('【')
+    if (cut >= 0) content = content.slice(0, cut)
+    const noM = heads[i].head.match(/镜头\s*(\d+)/)
+    const tm = heads[i].head.match(new RegExp(`([\\d.]+)${DASH}([\\d.]+)秒?`))
+    const no = noM ? parseInt(noM[1], 10) : i + 1
+    const dur = tm ? parseFloat(tm[2]) - parseFloat(tm[1]) : 5
+    const act = content.match(/动作[：:]\s*([\s\S]*?)(?=[。]?(?:表演触发|对白覆盖|对白对应|切点))/)
+    shots.push({ no, dur, action: act ? act[1].trim().replace(/[。\s]+$/, '') : '' })
   }
 
-  const dials: ParsedDial[] = []
-  // 新格式：第001句｜0.15—5.91秒｜LILY｜源S01-D01：Is this...（台词在冒号后同行）
-  const newDialRe = new RegExp(`第\\d+句｜[\\d.]+${DASH}[\\d.]+秒｜([A-Z]+)｜源[^：:\\n]*[：:]\\s*([^\\n]+)`, 'g')
-  let dm
-  while ((dm = newDialRe.exec(body)) !== null) {
-    const role = dm[1]
-    const line = dm[2].trim()
-    if (line && !dials.some((d) => d.role === role && d.line === line)) {
-      dials.push({ role, shot: 0, line })
-    }
-  }
-  // 旧格式：D001｜7.04—9.21秒｜NORA｜镜头3｜…（台词在后续弯引号里）
-  const oldDialRe = new RegExp(`D\\d+｜[\\d.]+${DASH}[\\d.]+秒｜([A-Z]+)｜镜头(\\d+)`, 'g')
-  while ((dm = oldDialRe.exec(body)) !== null) {
-    const role = dm[1]
-    const shot = parseInt(dm[2], 10)
-    const after = body.slice(dm.index + dm[0].length, dm.index + dm[0].length + 300)
-    const line = after.match(/\u201c([^\u201d]+)\u201d/)
-    if (line && !dials.some((d) => d.role === role && d.line === line[1])) {
-      dials.push({ role, shot, line: line[1] })
-    }
-  }
+  const dials = extractDialogues(body)
 
   // 资产引用：@前缀_…，前缀不限定，到中文标点/空白/竖线为止
   const refs: string[] = []
@@ -152,7 +169,7 @@ function parseSegment(body: string): {
   return { scene, shots, dials, refs }
 }
 
-// ---- 照抄版 prompt（方向2：整段原文照抄，仅把 @资产引用 替换成 [图N：标签]，不做重组/过滤）----
+// ---- 照抄版 prompt（整段原文照抄，仅把 @资产引用 替换成 [图N：标签]，不做重组/过滤）----
 function buildRawPrompt(body: string, refs: string[], refLabels: string[]): string {
   let prompt = body
   refs.forEach((ref, i) => {
@@ -162,9 +179,9 @@ function buildRawPrompt(body: string, refs: string[], refLabels: string[]): stri
   return prompt
 }
 
-/** 解析段标题行：兼容「## V001｜00:00–00:15｜标题」（时码中置）与「## V001｜标题｜全片00:00—00:15」（时码后置） */
+/** 解析段标题行：从「## V001｜字段1｜字段2」中识别时码（分:秒）与标题，不假设位置 */
 function parseHeading(line: string): { id: string; title: string; fromT: string; toT: string } | null {
-  const m = line.match(/^##\s*(V\d+)[｜|]\s*(.+?)[｜|]\s*(.+?)\s*$/)
+  const m = line.match(/^##\s*([A-Za-z]+\d+)[｜|]\s*(.+?)[｜|]\s*(.+?)\s*$/)
   if (!m) return null
   const f2 = m[2].trim()
   const f3 = m[3].trim()
@@ -178,7 +195,7 @@ function parseHeading(line: string): { id: string; title: string; fromT: string;
 
 // ---- 主解析：文本 → 结构化 shots（默认 raw）----
 export function parseStoryboardText(text: string): StoryboardShot[] {
-  const segRe = /^##\s*(V\d+)[｜|]/gm
+  const segRe = /^##\s*([A-Za-z]+\d+)[｜|]/gm
   const shots: StoryboardShot[] = []
   const starts: number[] = []
   let index = 1
@@ -337,7 +354,7 @@ export async function mergeVideos(videoPaths: string[], outPath: string): Promis
   }
 }
 
-// ---- 辅助：确保目录存在（供 IPC 层建输出目录）----
+// ---- 辅助：输出文件名 ----
 export function shotFileName(index: number): string {
   return `shot_${String(index).padStart(3, '0')}.mp4`
 }

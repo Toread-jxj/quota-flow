@@ -1126,6 +1126,10 @@ export function AddProviderModal({
         fingerprint: res.accountFingerprint ?? null,
         cookieCount: res.cookieCount ?? 0
       })
+      // 页面抓到的用户简称（昵称/手机号）作为默认账号名；用户可改，未抓到则保持空走「厂商名 账号 N」兜底
+      if (res.displayName && !accountName.trim()) {
+        setAccountName(res.displayName)
+      }
       const svc = getProviderService()
       let existing: Array<{ id: string; accountName: string; accountFingerprint: string | null }> = []
       if (svc) {

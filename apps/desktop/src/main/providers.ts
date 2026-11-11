@@ -179,6 +179,8 @@ export interface ProviderLoginResult {
   cookieCount?: number
   expiresAt?: number | null
   accountFingerprint?: string | null
+  /** 页面抓取到的用户简称/昵称（用于账号默认命名，抓不到为空） */
+  displayName?: string
   error?: string
   /**
    * 面向用户的友好提示：与 error 成对出现。
@@ -713,6 +715,73 @@ async function extractAccountFingerprint(
 // collectPartitionCookies 已能收集全部 cookie。localStorage 只需收集当前页面 origin 即可，
 // 不需要用 iframe 访问 sso/passport/auth 等域名（它们大多不存在或 SSL 证书无效，会产生大量错误日志）。
 
+// 页面用户简称抓取脚本：多候选（头像 alt/title → 昵称元素 → 头像附近文本 → 手机号兜底），
+// 抓不到返回空串。豆包等厂商登录后导航栏会显示用户昵称/头像。
+const DISPLAY_NAME_SCRIPT = `(() => {
+  const norm = (s) => (s || '').replace(/[\\s\\u00a0]+/g, ' ').trim();
+  const bad = /^(登录|注册|退出|退出登录|设置|菜单|账号|头像|帮助|反馈|我的|个人中心|充值|会员|登录\\/注册|注册\\/登录)$/i;
+  const cand = [];
+  const push = (s) => { const t = norm(s); if (t) cand.push(t); };
+  try {
+    const imgs = document.querySelectorAll('img');
+    for (const img of imgs) {
+      const cls = (img.getAttribute('class') || '') + ' ' + (img.src || '');
+      if (!/avatar|user|profile|head|account/i.test(cls)) continue;
+      push(img.alt); push(img.title);
+    }
+  } catch {}
+  try {
+    const sels = ['[class*="nickname"]','[class*="user-name"]','[class*="username"]','[class*="user_name"]','[class*="account-name"]','[class*="user-info"]','[class*="userinfo"]'];
+    for (const sel of sels) {
+      const el = document.querySelector(sel);
+      if (el) {
+        const t = norm(el.textContent || '');
+        if (t && t.length <= 30) push(t);
+      }
+    }
+  } catch {}
+  try {
+    const av = document.querySelector('img[class*="avatar"], [class*="avatar"]');
+    if (av && av.parentElement) {
+      const t = norm(av.parentElement.textContent || '');
+      if (t && t.length <= 30) push(t);
+    }
+  } catch {}
+  try {
+    const text = document.body ? document.body.innerText : '';
+    const m = text.match(/1[3-9]\\d{9}|\\d{3}\\*{4}\\d{4}/);
+    if (m) push(m[0]);
+  } catch {}
+  for (const c of cand) {
+    if (bad.test(c)) continue;
+    if (c.length >= 2 && c.length <= 30 && !/[|｜]/.test(c)) return c;
+  }
+  return '';
+})()`
+
+/** 登录成功后从页面抓取用户简称（昵称/手机号），抓不到返回 null，不阻断登录流程 */
+async function extractDisplayName(win: BrowserWindow, providerId: string): Promise<string | null> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    const raw = await Promise.race<unknown>([
+      win.webContents.executeJavaScript(DISPLAY_NAME_SCRIPT, true),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('display-name timeout')), 8000)
+      })
+    ])
+    if (typeof raw === 'string' && raw.trim()) {
+      const name = raw.trim().slice(0, 30)
+      console.log(`[qf-login] provider=${providerId} displayName=${name}`)
+      return name
+    }
+  } catch {
+    // 抓不到昵称不阻断登录，前端回退「厂商名 账号 N」
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+  return null
+}
+
 /**
  * 打开厂商登录窗口
  * @param providerId 厂商 id
@@ -980,6 +1049,8 @@ function openLoginWindow(providerId: string, keyId?: string): Promise<ProviderLo
 
               // 6) 登录成功：在窗口销毁前提取账号指纹（P2 去重）
               const accountFingerprint = await extractAccountFingerprint(win, providerId, cookies)
+              // 页面用户简称（昵称/手机号）——用于账号默认命名，抓不到为 null
+              const displayName = await extractDisplayName(win, providerId)
               const maxExp = Math.max(...cookies.map((c) => c.expires))
               const viewCookies = cookies.length
 
@@ -996,7 +1067,8 @@ function openLoginWindow(providerId: string, keyId?: string): Promise<ProviderLo
                 encrypted: encryptCookies(cookies, storages, providerId),
                 cookieCount: viewCookies,
                 expiresAt: maxExp > 0 ? maxExp : null,
-                accountFingerprint
+                accountFingerprint,
+                displayName: displayName ?? undefined
               })
             })
             .catch((e: unknown) => done({ ok: false, error: String(e) }))

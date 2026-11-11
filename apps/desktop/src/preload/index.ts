@@ -25,6 +25,8 @@ export interface ProviderLoginResult {
   cookieCount?: number
   expiresAt?: number | null
   accountFingerprint?: string | null
+  /** 页面抓取到的用户简称/昵称（用于账号默认命名，抓不到为空） */
+  displayName?: string
   error?: string
   /** 面向用户的友好提示，替代渲染层默认的「登录未获取到 Cookie」文案 */
   friendlyMessage?: string

@@ -7,6 +7,7 @@ import subprocess
 import secrets
 import string
 import sys
+import uuid
 
 DB = "supabase_db_quota-flow"
 # 易读字符集（去掉 0/O/1/l/I 等易混淆字符）
@@ -26,9 +27,31 @@ def run_sql(sql):
     return r
 
 
+def insert_user(email, pw):
+    # id 与 raw_user_meta_data.sub 必须一致（标准注册 sub = id）
+    uid = str(uuid.uuid4())
+    sql = (
+        "INSERT INTO auth.users "
+        "(instance_id, id, aud, role, email, encrypted_password, email_confirmed_at, "
+        "confirmation_token, recovery_token, email_change_token_new, email_change, "
+        "raw_app_meta_data, raw_user_meta_data, created_at, updated_at) "
+        "VALUES ("
+        "'00000000-0000-0000-0000-000000000000', "
+        f"'{uid}', "
+        "'authenticated', 'authenticated', "
+        f"'{email}', "
+        f"crypt('{pw}', gen_salt('bf')), "
+        "now(), "
+        "'', '', '', '', "
+        "'{\"provider\":\"email\",\"providers\":[\"email\"]}'::jsonb, "
+        f"jsonb_build_object('sub', '{uid}', 'email', '{email}', 'email_verified', true, 'phone_verified', false), "
+        "now(), now()"
+        ")"
+    )
+    return run_sql(sql)
+
+
 def main():
-    # 收集邮箱
-    emails = []
     args = sys.argv[1:]
     if args and args[0] == "-":
         emails = [ln.strip() for ln in sys.stdin if ln.strip()]
@@ -48,23 +71,7 @@ def main():
             continue
 
         pw = gen_password(6)
-        sql = (
-            "INSERT INTO auth.users "
-            "(instance_id, id, aud, role, email, encrypted_password, email_confirmed_at, raw_user_meta_data, created_at, updated_at) "
-            "VALUES ("
-            "'00000000-0000-0000-0000-000000000000', "
-            "gen_random_uuid(), "
-            "'authenticated', "
-            "'authenticated', "
-            f"'{email}', "
-            f"crypt('{pw}', gen_salt('bf')), "
-            "now(), "
-            "'{}', "
-            "now(), "
-            "now()"
-            ")"
-        )
-        r = run_sql(sql)
+        r = insert_user(email, pw)
         if r.returncode == 0:
             results.append((email, pw, "成功"))
         else:

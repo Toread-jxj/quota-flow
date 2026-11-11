@@ -748,6 +748,26 @@ const DISPLAY_NAME_SCRIPT = `(() => {
     }
   } catch {}
   try {
+    const fields = ['nickname','nick_name','nickName','name','userName','user_name','displayName','display_name','username','phone','mobile','email'];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !/user|account|profile|nick|name|login|info|phone|mobile/i.test(k)) continue;
+      const v = localStorage.getItem(k);
+      if (!v) continue;
+      try {
+        const obj = JSON.parse(v);
+        const walk = (o, depth) => {
+          if (!o || typeof o !== 'object' || depth > 2) return;
+          for (const f of fields) { if (typeof o[f] === 'string' && o[f].trim()) push(o[f]); }
+          for (const f of ['user','userInfo','user_info','profile','data','account']) { if (o[f] && typeof o[f] === 'object') walk(o[f], depth + 1); }
+        };
+        walk(obj, 0);
+      } catch {
+        if (v.length <= 30) push(v);
+      }
+    }
+  } catch {}
+  try {
     const text = document.body ? document.body.innerText : '';
     const m = text.match(/1[3-9]\\d{9}|\\d{3}\\*{4}\\d{4}/);
     if (m) push(m[0]);

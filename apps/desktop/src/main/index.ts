@@ -26,6 +26,7 @@ import type { WatermarkProgress } from './watermark-remover/engine'
 import { getMaterialStore } from './materials/store'
 import { uploadImage as uploadImageToGh, cleanupOldImages } from './github-upload'
 import { clearKeysCache, handleKeysCacheInvalidate } from './query-cache'
+import { generationLogPath, logGeneration } from './diagnostics'
 
 /** 活跃生成任务注册表：jobId → 取消/已提交状态（用于「终止生成」与「关闭确认」） */
 interface ActiveRunState {
@@ -779,8 +780,10 @@ app.whenReady().then(() => {
   ipcMain.handle(
     'storyboard:generate',
     async (_e, params: { gen: Parameters<typeof runGenerate>[0]; batchDir: string; index: number }) => {
+      logGeneration('storyboard-generate-start', { index: params.index, durationSec: params.gen.durationSec, preferredAccountId: params.gen.preferredAccountId ?? null, mode: params.gen.mode })
       try {
         const result = await runGenerate(params.gen, () => {}, undefined, undefined)
+        logGeneration('storyboard-generate-result', { index: params.index, ok: result.ok, jobId: result.jobId ?? null, error: result.error ?? null, accountId: result.accountId ?? null, hasRemoteUrl: !!result.remoteUrl })
         if (!result.ok || !result.jobId) {
           writeStoryboardProgress(params.batchDir, params.index, { jobId: result.jobId || null, remoteUrl: null, accountId: result.accountId || null, status: 'error' })
           return { ok: false, error: result.error || '生成失败', accountId: result.accountId ?? null }
@@ -802,10 +805,13 @@ app.whenReady().then(() => {
         writeStoryboardProgress(params.batchDir, params.index, { jobId: result.jobId, remoteUrl: result.remoteUrl || null, videoPath: dst, status: 'done', accountId: result.accountId ?? null })
         return { ok: true, videoPath: dst, jobId: result.jobId }
       } catch (e) {
+        logGeneration('storyboard-generate-exception', { index: params.index, error: e })
         return { ok: false, error: e instanceof Error ? e.message : String(e) }
       }
     }
   )
+
+  ipcMain.handle('storyboard:diagnostics-path', async () => ({ ok: true, path: generationLogPath() }))
 
   ipcMain.handle('storyboard:merge', async (_e, params: { batchDir: string }) => {
     try {

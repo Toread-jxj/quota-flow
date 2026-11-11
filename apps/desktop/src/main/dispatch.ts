@@ -24,6 +24,9 @@ import {
   cachedListTeamProviderKeysWithSecrets,
   invalidateKeysByKeyId
 } from './query-cache'
+import { withElectronNet } from './supabase-network'
+import { findNextProviderAccount } from './account-selection'
+import { logGeneration } from './diagnostics'
 
 export interface GenerateInput {
   supabaseUrl: string
@@ -358,14 +361,17 @@ export async function runGenerate(
   onJobCreated?: (jobId: string, state: { aborted: boolean; submitted: boolean }) => void,
   onQuotaUpdated?: (payload: QuotaUpdatedPayload) => void
 ): Promise<{ ok: boolean; jobId?: string; error?: string; remoteUrl?: string | null; accountId?: string | null }> {
+  logGeneration('run-start', { providerId: input.providerId, durationSec: input.durationSec, mode: input.mode, preferredAccountId: input.preferredAccountId ?? null })
   if (!input.supabaseUrl || !input.supabaseAnonKey) {
     return { ok: false, error: 'Supabase 未配置' }
   }
 
-  const client = createSupabaseClient({
-    supabaseUrl: input.supabaseUrl,
-    supabaseAnonKey: input.supabaseAnonKey
-  })
+  const client = createSupabaseClient(
+    withElectronNet({
+      supabaseUrl: input.supabaseUrl,
+      supabaseAnonKey: input.supabaseAnonKey
+    })
+  )
   try {
     await client.auth.setSession({ access_token: input.accessToken, refresh_token: input.refreshToken })
   } catch {
@@ -484,13 +490,22 @@ export async function runGenerate(
       // 手工指定账号：校验可用性并锁定（不可用直接报错，不静默回退自动选号）
       if (input.preferredAccountId) {
         const preferred = providerKeys.find((k) => k.id === input.preferredAccountId)
-        const prefFail = (msg: string): { ok: false; jobId: string; error: string; accountId: string | null } => {
-          void jobSvc.updateJob(input.userId, job.id, { status: 'failed', error: msg, options: jobOptions, completedAt: new Date().toISOString() }).catch(() => {})
+        const prefFail = async (msg: string): Promise<{ ok: false; jobId: string; error: string; accountId: string | null }> => {
+          try {
+            await jobSvc.updateJob(input.userId, job.id, {
+              status: 'failed',
+              error: msg,
+              options: jobOptions,
+              completedAt: new Date().toISOString()
+            })
+          } catch (e) {
+            console.error('[dispatch] 指定账号失败状态回写失败:', e)
+          }
           emit({ jobId: job.id, status: 'failed', message: msg })
           return { ok: false, jobId: job.id, error: msg, accountId: input.preferredAccountId ?? null }
         }
-        if (!preferred) return prefFail('指定的账号不存在或已解绑，请换账号或改回「自动」')
-        if (preferred.health_status === 'expired') return prefFail(`账号「${preferred.account_name || '未命名'}」登录态已失效，请换账号或改回「自动」`)
+        if (!preferred) return await prefFail('指定的账号不存在或已解绑，请换账号或改回「自动」')
+        if (preferred.health_status === 'expired') return await prefFail(`账号「${preferred.account_name || '未命名'}」登录态已失效，请换账号或改回「自动」`)
         // 手工指定 = 人工授权：忽略当日时长上限（B 方案），仅校验账号存在与登录态
         sorted.length = 0
         sorted.push(preferred)
@@ -498,7 +513,7 @@ export async function runGenerate(
 
       const tried = new Set<string>()
       for (let round = 0; round < Math.min(providerKeys.length, 3); round++) {
-        const cand = sorted.find((k) => !tried.has(k.id) && remainingOf(k.id) >= cost)
+        const cand = findNextProviderAccount(sorted, tried, remainingOf, cost, input.preferredAccountId)
         if (!cand) {
           lastError = lastError || `所有${providerLabel(resolvedProviderId)}账号剩余额度不足（本次需 ${cost} ${costUnit}）`
           break
@@ -716,10 +731,15 @@ export async function runGenerate(
       }
       consumed = teamResult.row ?? null
     } else {
-      consumed = await providerSvc.consumeLedger(input.userId, resolvedProviderId, cost, {
-        unitName: costUnit,
-        keyId: selectedKey?.id ?? undefined
-      })
+      consumed = input.preferredAccountId
+        ? await providerSvc.consumeLedgerManual(input.userId, resolvedProviderId, cost, {
+            unitName: costUnit,
+            keyId: selectedKey?.id ?? undefined
+          })
+        : await providerSvc.consumeLedger(input.userId, resolvedProviderId, cost, {
+            unitName: costUnit,
+            keyId: selectedKey?.id ?? undefined
+          })
       if (selectedKey?.id && consumed) {
         await providerSvc.insertQuotaOperation(job.id, consumed.id, 'finalize', cost)
       }
@@ -800,10 +820,12 @@ async function runApiBranch(
   const providerId = input.providerId
   const branch = API_BRANCHES[providerId]
 
-  const client = createSupabaseClient({
-    supabaseUrl: input.supabaseUrl,
-    supabaseAnonKey: input.supabaseAnonKey
-  })
+  const client = createSupabaseClient(
+    withElectronNet({
+      supabaseUrl: input.supabaseUrl,
+      supabaseAnonKey: input.supabaseAnonKey
+    })
+  )
   try {
     await client.auth.setSession({ access_token: input.accessToken, refresh_token: input.refreshToken })
   } catch {

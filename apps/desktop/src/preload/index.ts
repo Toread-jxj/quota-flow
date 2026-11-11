@@ -524,6 +524,7 @@ export interface DesktopApi {
     listVideos: (params: { keyId?: string }) => Promise<{ ok: boolean; videos?: Array<{ src: string; poster?: string }>; error?: string }>
     autoRetry: (params: { keyId?: string; batchDir: string; index: number; maxAttempts?: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
     manualDownload: (params: { url: string; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
+    diagnosticsPath: () => Promise<{ ok: boolean; path?: string }>
   }
 }
 
@@ -764,7 +765,8 @@ const api: DesktopApi = {
     downloadLatest: (params) => ipcRenderer.invoke('doubao:download-latest', params),
     listVideos: (params) => ipcRenderer.invoke('doubao:list-videos', params),
     autoRetry: (params) => ipcRenderer.invoke('doubao:auto-retry', params),
-    manualDownload: (params) => ipcRenderer.invoke('storyboard:manual-download', params)
+    manualDownload: (params) => ipcRenderer.invoke('storyboard:manual-download', params),
+    diagnosticsPath: () => ipcRenderer.invoke('storyboard:diagnostics-path')
   },
 }
 

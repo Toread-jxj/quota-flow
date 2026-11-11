@@ -4,6 +4,8 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 export interface SupabaseConfig {
   supabaseUrl: string
   supabaseAnonKey: string
+  /** 可选自定义网络实现；Electron 主进程可传 net.fetch 复用 Chromium 网络栈。 */
+  fetch?: typeof fetch
 }
 
 /* ================= 跨模块 in-flight 读去重 =================
@@ -50,7 +52,8 @@ export function createSupabaseClient(config: SupabaseConfig): SupabaseClient {
       persistSession: false,
       autoRefreshToken: false,
       detectSessionInUrl: false
-    }
+    },
+    ...(config.fetch ? { global: { fetch: config.fetch } } : {})
   })
 }
 
@@ -856,6 +859,26 @@ export class ProviderService {
     }
 
     throw new Error(`[${result.code || 'UNKNOWN'}] ${result.message || '额度扣减失败'}`)
+  }
+
+  /** 手工指定账号：记录实际使用量但不因本地日额度不足拒绝。 */
+  async consumeLedgerManual(
+    userId: string,
+    providerId: string,
+    amount: number,
+    opts: { unitName?: string; keyId?: string | null } = {}
+  ): Promise<QuotaLedgerRow> {
+    const { data, error } = await this.client.rpc('atomic_consume_ledger_manual', {
+      p_user_id: userId,
+      p_provider_id: providerId,
+      p_amount: amount,
+      p_key_id: opts.keyId ?? null,
+      p_date: todayKey()
+    })
+    if (error) throw error
+    const result = (data ?? {}) as LedgerResult
+    if (result.ok && result.row) return result.row as QuotaLedgerRow
+    throw new Error(`[${result.code || 'UNKNOWN'}] ${result.message || '手工额度记录失败'}`)
   }
 
   async consumeTeamQuotaAndFinalize(

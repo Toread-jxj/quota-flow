@@ -11,7 +11,7 @@
 //   - 动作      镜头块内「动作：」字段
 //   - 破折号 em-dash / en-dash / 连字符 全部兼容
 
-import { readdir, writeFile, rm } from 'node:fs/promises'
+import { readdir, writeFile, rm, readFile } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -193,40 +193,48 @@ function parseHeading(line: string): { id: string; title: string; fromT: string;
   return { id: m[1], title: f2, fromT: '0:0', toT: '0:15' }
 }
 
+/** 从正文提取项目名（书名号《…》），用于无 ## 标题的单段分镜词 */
+function extractTitle(body: string): string {
+  const t = body.match(/《([^》]+)》/)
+  return t ? t[1] : '分镜'
+}
+
+/** 内容打分：判断 .md 文本是否像分镜词（靠结构特征，不靠文件名） */
+function storyboardScore(text: string): number {
+  let score = 0
+  if (/^##\s*[A-Za-z]+\d+[｜|]/m.test(text)) score += 3 // 分段标题
+  if (/【[^】]*镜头[^】]*】/.test(text)) score += 3 // 镜头栏目（核心特征）
+  if ((text.match(/【[^】]+】/g) || []).length >= 3) score += 2 // 多个栏目
+  if (/【[^】]*对白[^】]*】/.test(text)) score += 1 // 对白栏目
+  if (/@[A-Za-z0-9_]/.test(text)) score += 1 // 资产引用
+  if (/动作[：:]/.test(text)) score += 1 // 动作字段
+  return score
+}
+
 // ---- 主解析：文本 → 结构化 shots（默认 raw）----
 export function parseStoryboardText(text: string): StoryboardShot[] {
   const segRe = /^##\s*([A-Za-z]+\d+)[｜|]/gm
-  const shots: StoryboardShot[] = []
   const starts: number[] = []
-  let index = 1
   let m
   while ((m = segRe.exec(text)) !== null) starts.push(m.index)
 
-  for (let i = 0; i < starts.length; i++) {
-    const from = starts[i]
-    const end = i + 1 < starts.length ? starts[i + 1] : text.length
-    const segText = text.slice(from, end)
-    const nl = segText.indexOf('\n')
-    const headingLine = nl === -1 ? segText : segText.slice(0, nl)
-    const h = parseHeading(headingLine)
-    if (!h) continue
+  const shots: StoryboardShot[] = []
+  let index = 1
 
-    const body = segText
+  const pushSeg = (body: string, id: string, title: string, dur: number): void => {
     const { scene, shots: lens, dials, refs } = parseSegment(body)
-    const dur = toSec(h.toT) - toSec(h.fromT)
     const refLabels = refs.map((r) => friendlyLabel(r))
-
     const mk = (
-      id: string,
-      title: string,
+      sid: string,
+      stitle: string,
       l: ParsedLens[],
       d: ParsedDial[],
       actionsField: string[],
       dialsField: ParsedDial[]
     ): StoryboardShot => ({
       index: index++,
-      id,
-      title,
+      id: sid,
+      title: stitle,
       durationSec: snapDuration(l.reduce((s, x) => s + x.dur, 0)),
       scene,
       actions: actionsField,
@@ -237,7 +245,7 @@ export function parseStoryboardText(text: string): StoryboardShot[] {
     })
 
     if (dur <= 15 || lens.length <= 1) {
-      shots.push(mk(h.id, h.title, lens, dials, lens.map((x) => x.action), dials))
+      shots.push(mk(id, title, lens, dials, lens.map((x) => x.action), dials))
     } else {
       let cum = 0
       let cut = lens.length - 1
@@ -249,9 +257,28 @@ export function parseStoryboardText(text: string): StoryboardShot[] {
       const l2 = lens.slice(cut)
       const d1 = dials.filter((d) => d.shot <= cut)
       const d2 = dials.filter((d) => d.shot > cut)
-      shots.push(mk(`${h.id}a`, `${h.title}（前段）`, l1, d1, l1.map((x) => x.action), d1))
-      shots.push(mk(`${h.id}b`, `${h.title}（后段）`, l2, d2, l2.map((x) => x.action), d2))
+      shots.push(mk(`${id}a`, `${title}（前段）`, l1, d1, l1.map((x) => x.action), d1))
+      shots.push(mk(`${id}b`, `${title}（后段）`, l2, d2, l2.map((x) => x.action), d2))
     }
+  }
+
+  // 无 ## 分段标题：整个文本当作单段分镜词
+  if (starts.length === 0) {
+    const parsed = parseSegment(text)
+    const dur = parsed.shots.reduce((s, x) => s + x.dur, 0)
+    pushSeg(text, 'V001', extractTitle(text), dur)
+    return shots
+  }
+
+  for (let i = 0; i < starts.length; i++) {
+    const from = starts[i]
+    const end = i + 1 < starts.length ? starts[i + 1] : text.length
+    const segText = text.slice(from, end)
+    const nl = segText.indexOf('\n')
+    const headingLine = nl === -1 ? segText : segText.slice(0, nl)
+    const h = parseHeading(headingLine)
+    if (!h) continue
+    pushSeg(segText, h.id, h.title, toSec(h.toT) - toSec(h.fromT))
   }
   return shots
 }
@@ -260,6 +287,8 @@ export function parseStoryboardText(text: string): StoryboardShot[] {
 // 分镜词默认放工作目录根：根目录有 .md 就只认根目录（不把资产子文件夹里的说明 md 误当分镜词）；
 // 根目录没有时才递归兜底。
 export async function findStoryboardFiles(workDir: string): Promise<string[]> {
+  // 收集候选 .md（根目录优先，递归兜底）
+  const candidates: string[] = []
   let entries
   try {
     entries = await readdir(workDir, { withFileTypes: true })
@@ -269,24 +298,39 @@ export async function findStoryboardFiles(workDir: string): Promise<string[]> {
   const rootMd = entries
     .filter((e) => e.isFile() && /\.md$/i.test(e.name))
     .map((e) => join(workDir, e.name))
-  if (rootMd.length > 0) return rootMd
-
-  const result: string[] = []
-  const walk = async (dir: string): Promise<void> => {
-    let es
-    try {
-      es = await readdir(dir, { withFileTypes: true })
-    } catch {
-      return
+  if (rootMd.length > 0) {
+    candidates.push(...rootMd)
+  } else {
+    const walk = async (dir: string): Promise<void> => {
+      let es
+      try {
+        es = await readdir(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const e of es) {
+        const full = join(dir, e.name)
+        if (e.isDirectory()) await walk(full)
+        else if (e.isFile() && /\.md$/i.test(e.name)) candidates.push(full)
+      }
     }
-    for (const e of es) {
-      const full = join(dir, e.name)
-      if (e.isDirectory()) await walk(full)
-      else if (e.isFile() && /\.md$/i.test(e.name)) result.push(full)
-    }
+    await walk(workDir)
   }
-  await walk(workDir)
-  return result
+
+  // 读内容打分：只保留像分镜词的（靠结构特征，不靠文件名），按匹配度降序
+  const scored: { path: string; score: number }[] = []
+  for (const p of candidates) {
+    let text = ''
+    try {
+      text = await readFile(p, 'utf8')
+    } catch {
+      continue
+    }
+    const s = storyboardScore(text)
+    if (s >= 3) scored.push({ path: p, score: s })
+  }
+  scored.sort((a, b) => b.score - a.score)
+  return scored.map((x) => x.path)
 }
 
 // ---- 资产匹配：递归扫描工作目录下所有图片，建立 stem→path，用 refs 分级匹配 ----

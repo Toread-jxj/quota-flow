@@ -552,7 +552,7 @@ function MainApp({
             <History jobs={jobs} features={permissions.features} onRegenerate={handleRegenerate} />
           </div>
           <div className="tab-pane" style={{ display: resolvedTab === 'storyboard' ? 'flex' : 'none' }}>
-            <StoryboardEditor user={user} onToast={showToast} />
+            <StoryboardEditor user={user} providers={providers} onToast={showToast} />
           </div>
           <div className="tab-pane" style={{ display: resolvedTab === 'team' ? 'flex' : 'none' }}>
             <Team

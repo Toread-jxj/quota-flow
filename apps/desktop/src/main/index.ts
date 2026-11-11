@@ -13,10 +13,11 @@ import {
   initAutoUpdater,
   quitAndInstall as quitAndInstallUpdater
 } from './updater'
-import { runGenerate } from './dispatch'
+import { runGenerate, downloadVideo } from './dispatch'
 import type { DispatchEvent, QuotaUpdatedPayload } from './dispatch'
 import { initApiServer, setApiContext } from './api-server'
 import { parseStoryboardText, matchAssets, mergeVideos, shotFileName, findStoryboardFiles } from './storyboard'
+import { openDoubaoPage, extractLatestDoubaoVideoUrl, autoRetryExtractDoubaoVideo, extractAllDoubaoVideos } from './webview-engine'
 import type { ApiContext } from './api-server'
 import type { UpdaterStatus } from './updater'
 import { getWatermarkStatus, processWatermarkJob } from './watermark-remover/job'
@@ -368,17 +369,19 @@ app.whenReady().then(() => {
     return `http://127.0.0.1:${port}/ref-videos/${name}`
   })
 
-  ipcMain.handle('media:show-in-folder', (_e, filePath: unknown) => {
+  ipcMain.handle('media:show-in-folder', (_e, filePath: unknown, root?: unknown) => {
     if (typeof filePath !== 'string' || !filePath) throw new Error('invalid path')
-    // 只允许打开 userData/videos 下的文件，避免 renderer 被诱导打开任意路径
-    const videosDir = join(app.getPath('userData'), 'videos')
+    // 只允许打开 userData/videos、userData/storyboard 或指定 root（工作目录）下的文件，避免 renderer 被诱导打开任意路径
+    const allowedDirs = [join(app.getPath('userData'), 'videos'), join(app.getPath('userData'), 'storyboard')]
+    if (typeof root === 'string' && root) allowedDirs.push(root)
     const resolved = resolve(filePath)
-    const dir = videosDir.toLowerCase()
     const target = resolved.toLowerCase()
-    const inVideos =
-      target === dir || target.startsWith(dir + '\\') || target.startsWith(dir + '/')
-    if (!inVideos) throw new Error('path outside videos directory')
-    if (!existsSync(resolved)) return { ok: false, error: '视频文件不存在' }
+    const inAllowed = allowedDirs.some((d) => {
+      const dir = d.toLowerCase()
+      return target === dir || target.startsWith(dir + '\\') || target.startsWith(dir + '/')
+    })
+    if (!inAllowed) throw new Error('path outside allowed directories')
+    if (!existsSync(resolved)) return { ok: false, error: '文件不存在' }
     shell.showItemInFolder(resolved)
     return { ok: true }
   })
@@ -706,6 +709,30 @@ app.whenReady().then(() => {
     return { canceled: false, dir: r.filePaths[0] }
   })
 
+  // ---- 分镜编排进度文件（.storyboard-progress.json，记录每段 shot 的 jobId/remoteUrl/视频路径）----
+  const readStoryboardProgress = (workDir: string): Record<string, { jobId?: string; remoteUrl?: string; videoPath?: string; status?: string; accountId?: string | null }> => {
+    try {
+      const p = join(workDir, '.storyboard-progress.json')
+      if (!existsSync(p)) return {}
+      const raw = JSON.parse(readFileSync(p, 'utf8'))
+      return (raw && raw.shots) || {}
+    } catch {
+      return {}
+    }
+  }
+  const writeStoryboardProgress = (workDir: string, index: number, entry: { jobId?: string | null; remoteUrl?: string | null; videoPath?: string; status?: string; accountId?: string | null }): void => {
+    try {
+      const p = join(workDir, '.storyboard-progress.json')
+      let raw: { shots?: Record<string, unknown> } = {}
+      if (existsSync(p)) {
+        try { raw = JSON.parse(readFileSync(p, 'utf8')) } catch { raw = {} }
+      }
+      raw.shots = raw.shots || {}
+      raw.shots[String(index)] = { ...(raw.shots[String(index)] as Record<string, unknown> || {}), ...entry }
+      writeFileSync(p, JSON.stringify(raw, null, 2), 'utf8')
+    } catch {}
+  }
+
   ipcMain.handle('storyboard:parse', async (_e, params: { textPath?: string; workDir: string }) => {
     try {
       let textPath = params.textPath
@@ -721,9 +748,29 @@ app.whenReady().then(() => {
         shot.images = await matchAssets(shot.refs, params.workDir)
       }
       const batchId = (textPath.split(/[\\/]/).pop() || 'storyboard').replace(/\.[^.]+$/, '')
-      const batchDir = join(app.getPath('userData'), 'storyboard', batchId)
-      mkdirSync(batchDir, { recursive: true })
-      return { ok: true, result: { batchId, provider: 'doubao', textPath, batchDir, shots } }
+      // 视频直接存工作目录：workDir/shots/shot_NNN.mp4，合并出 workDir/final.mp4
+      const batchDir = params.workDir
+      const shotsDir = join(batchDir, 'shots')
+      mkdirSync(shotsDir, { recursive: true })
+      // 进度恢复：读进度文件 + 扫 shots 目录，关联已生成视频 / 记录 remoteUrl（供补回）
+      const savedProgress = readStoryboardProgress(params.workDir)
+      const progress: Record<number, { jobId?: string; remoteUrl?: string; videoPath?: string; status?: string; accountId?: string | null }> = {}
+      for (const shot of shots) {
+        const idx = shot.index
+        const saved = savedProgress[String(idx)] || {}
+        const filePath = join(shotsDir, shotFileName(idx))
+        if (existsSync(filePath)) {
+          progress[idx] = { ...saved, videoPath: filePath, status: 'done' }
+        } else if (saved.remoteUrl) {
+          // 文件已丢失但进度里还有 remoteUrl：清掉 videoPath（避免前端误判「文件还在」），
+          // 保留 remoteUrl/jobId/accountId 供「补下载」和「打开豆包」两个兜底
+          progress[idx] = { ...saved, videoPath: undefined, status: 'error' }
+        } else if (saved.jobId || saved.accountId) {
+          // 生成失败（无 URL）：保留失败状态 + accountId（供「打开豆包」人工兜底）
+          progress[idx] = { ...saved, videoPath: undefined, status: 'error' }
+        }
+      }
+      return { ok: true, result: { batchId, provider: 'doubao', textPath, batchDir, shotsDir, shots, progress } }
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) }
     }
@@ -734,14 +781,26 @@ app.whenReady().then(() => {
     async (_e, params: { gen: Parameters<typeof runGenerate>[0]; batchDir: string; index: number }) => {
       try {
         const result = await runGenerate(params.gen, () => {}, undefined, undefined)
-        if (!result.ok || !result.jobId) return { ok: false, error: result.error || '生成失败' }
-        const src = join(app.getPath('userData'), 'videos', `${result.jobId}.mp4`)
-        if (!existsSync(src)) return { ok: false, error: '视频未落盘（可能下载失败）' }
+        if (!result.ok || !result.jobId) {
+          writeStoryboardProgress(params.batchDir, params.index, { jobId: result.jobId || null, remoteUrl: null, accountId: result.accountId || null, status: 'error' })
+          return { ok: false, error: result.error || '生成失败', accountId: result.accountId ?? null }
+        }
+        let src = join(app.getPath('userData'), 'videos', `${result.jobId}.mp4`)
+        if (!existsSync(src) && result.remoteUrl) {
+          // 补下载：runGenerate 内下载失败（如 Node 不走系统代理），用 remoteUrl 重试
+          const retried = await downloadVideo(result.remoteUrl, result.jobId, 'doubao')
+          if (retried) src = retried
+        }
+        if (!existsSync(src)) {
+          writeStoryboardProgress(params.batchDir, params.index, { jobId: result.jobId, remoteUrl: result.remoteUrl || null, status: 'error' })
+          return { ok: false, error: '视频未落盘（可能下载失败）', jobId: result.jobId, remoteUrl: result.remoteUrl || null, accountId: result.accountId ?? null }
+        }
         const shotsDir = join(params.batchDir, 'shots')
         mkdirSync(shotsDir, { recursive: true })
         const dst = join(shotsDir, shotFileName(params.index))
         copyFileSync(src, dst)
-        return { ok: true, videoPath: dst }
+        writeStoryboardProgress(params.batchDir, params.index, { jobId: result.jobId, remoteUrl: result.remoteUrl || null, videoPath: dst, status: 'done', accountId: result.accountId ?? null })
+        return { ok: true, videoPath: dst, jobId: result.jobId }
       } catch (e) {
         return { ok: false, error: e instanceof Error ? e.message : String(e) }
       }
@@ -754,11 +813,128 @@ app.whenReady().then(() => {
       const files = readdirSync(shotsDir).filter((f) => /^shot_\d+\.mp4$/.test(f))
       files.sort((a, b) => parseInt(a.match(/\d+/)![0], 10) - parseInt(b.match(/\d+/)![0], 10))
       if (files.length === 0) return { ok: false, error: '没有已生成的片段' }
-      const mergedDir = join(params.batchDir, 'merged')
-      mkdirSync(mergedDir, { recursive: true })
-      const finalPath = join(mergedDir, 'final.mp4')
+      const finalPath = join(params.batchDir, 'final.mp4')
       await mergeVideos(files.map((f) => join(shotsDir, f)), finalPath)
       return { ok: true, output: finalPath }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  ipcMain.handle('storyboard:re-download', async (_e, params: { remoteUrl: string; jobId: string; batchDir: string; index: number }) => {
+    try {
+      if (!params.remoteUrl) return { ok: false, error: '缺少远程视频 URL' }
+      let dlError = ''
+      const downloaded = await downloadVideo(params.remoteUrl, params.jobId, 'doubao', 0, (reason) => { dlError = reason })
+      if (!downloaded) return { ok: false, error: dlError || '补下载失败' }
+      const shotsDir = join(params.batchDir, 'shots')
+      mkdirSync(shotsDir, { recursive: true })
+      const dst = join(shotsDir, shotFileName(params.index))
+      copyFileSync(downloaded, dst)
+      writeStoryboardProgress(params.batchDir, params.index, { jobId: params.jobId, remoteUrl: params.remoteUrl, videoPath: dst, status: 'done' })
+      return { ok: true, videoPath: dst }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  // 手动填 URL 下载（第四层兜底）：程序判断失败/无 URL 时，用户从别处复制视频链接粘贴下载到对应 shot
+  ipcMain.handle('storyboard:manual-download', async (_e, params: { url: string; batchDir: string; index: number }) => {
+    try {
+      const url = (params.url || '').trim()
+      if (!url) return { ok: false, error: '请填写视频 URL' }
+      if (!/^https?:\/\//i.test(url)) return { ok: false, error: 'URL 格式无效，需以 http(s):// 开头' }
+      let dlError = ''
+      const jobId = `manual-${params.index}-${Date.now()}`
+      const downloaded = await downloadVideo(url, jobId, 'doubao', 0, (reason) => { dlError = reason })
+      if (!downloaded) return { ok: false, error: dlError || '下载失败' }
+      const shotsDir = join(params.batchDir, 'shots')
+      mkdirSync(shotsDir, { recursive: true })
+      const dst = join(shotsDir, shotFileName(params.index))
+      copyFileSync(downloaded, dst)
+      writeStoryboardProgress(params.batchDir, params.index, { jobId, remoteUrl: url, videoPath: dst, status: 'done' })
+      return { ok: true, videoPath: dst }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  ipcMain.handle('job:re-download', async (_e, params: { jobId: string; remoteUrl: string; userId: string; supabaseUrl: string; supabaseAnonKey: string; accessToken: string; refreshToken: string }) => {
+    try {
+      let dlError = ''
+      const downloaded = await downloadVideo(params.remoteUrl, params.jobId, 'doubao', 0, (reason) => { dlError = reason })
+      if (!downloaded) return { ok: false, error: dlError || '补下载失败' }
+      try {
+        const client = createSupabaseClient({ supabaseUrl: params.supabaseUrl, supabaseAnonKey: params.supabaseAnonKey })
+        await client.auth.setSession({ access_token: params.accessToken, refresh_token: params.refreshToken })
+        const { data: job } = await client.from('jobs').select('options').eq('id', params.jobId).eq('user_id', params.userId).single()
+        const existingOptions = (job?.options as Record<string, unknown>) || {}
+        const jobSvc = new JobService(client)
+        await jobSvc.updateJob(params.userId, params.jobId, {
+          options: { ...existingOptions, localPath: downloaded, originalLocalPath: downloaded, cleanLocalPath: null }
+        })
+      } catch {
+        // 更新 job 记录失败不阻断（视频已下载到本地）
+      }
+      return { ok: true, videoPath: downloaded }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  // 打开豆包页面（人工兜底）：自动化超时/风控未取到 URL 时，用对应账号分区重开豆包页，让用户手动去历史里下载
+  ipcMain.handle('doubao:open-page', async (_e, params: { keyId?: string }) => {
+    try {
+      return openDoubaoPage(params.keyId)
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  // 从已打开的豆包窗口提取最新视频并下载到对应 shot（人工看到视频后手动触发）
+  ipcMain.handle('doubao:download-latest', async (_e, params: { keyId?: string; batchDir: string; index: number }) => {
+    try {
+      const r = await extractLatestDoubaoVideoUrl(params.keyId)
+      if (!r.ok || !r.videoUrl) return { ok: false, error: r.error || '未提取到视频 URL' }
+      let dlError = ''
+      const jobId = `manual-${params.index}-${Date.now()}`
+      const downloaded = await downloadVideo(r.videoUrl, jobId, 'doubao', 0, (reason) => { dlError = reason })
+      if (!downloaded) return { ok: false, error: dlError || '下载失败' }
+      const shotsDir = join(params.batchDir, 'shots')
+      mkdirSync(shotsDir, { recursive: true })
+      const dst = join(shotsDir, shotFileName(params.index))
+      copyFileSync(downloaded, dst)
+      writeStoryboardProgress(params.batchDir, params.index, { jobId, remoteUrl: r.videoUrl, videoPath: dst, status: 'done' })
+      return { ok: true, videoPath: dst }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  // 提取豆包窗口里所有视频（供「选视频」兜底：用户挑任意一条下载，非只取最后一条）
+  ipcMain.handle('doubao:list-videos', async (_e, params: { keyId?: string }) => {
+    try {
+      return extractAllDoubaoVideos(params.keyId)
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+  })
+
+  // 自动拉取：生成失败后，后台隐藏窗口重开豆包页轮询提取最新视频，带次数限制
+  ipcMain.handle('doubao:auto-retry', async (_e, params: { keyId?: string; batchDir: string; index: number; maxAttempts?: number }) => {
+    try {
+      const r = await autoRetryExtractDoubaoVideo(params.keyId, params.maxAttempts ?? 3, 20000)
+      if (!r.ok || !r.videoUrl) return { ok: false, error: r.error || '自动拉取失败' }
+      let dlError = ''
+      const jobId = `auto-${params.index}-${Date.now()}`
+      const downloaded = await downloadVideo(r.videoUrl, jobId, 'doubao', 0, (reason) => { dlError = reason })
+      if (!downloaded) return { ok: false, error: dlError || '下载失败' }
+      const shotsDir = join(params.batchDir, 'shots')
+      mkdirSync(shotsDir, { recursive: true })
+      const dst = join(shotsDir, shotFileName(params.index))
+      copyFileSync(downloaded, dst)
+      writeStoryboardProgress(params.batchDir, params.index, { jobId, remoteUrl: r.videoUrl, videoPath: dst, status: 'done' })
+      return { ok: true, videoPath: dst }
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) }
     }

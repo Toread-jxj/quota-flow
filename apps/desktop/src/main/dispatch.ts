@@ -56,6 +56,10 @@ export interface GenerateInput {
   audioLocalPath?: string
   /** 测试开关：显示豆包 WebView 窗口（默认隐藏） */
   showWebview?: boolean
+  /** 手工指定账号：指定用某个厂商账号生成（provider_keys 的 keyId），为空/null 则自动选号 */
+  preferredAccountId?: string | null
+  /** 批量模式自动确认：豆包要求确认参数时自动回「确认」而不弹窗 */
+  autoConfirm?: boolean
 }
 
 export interface DispatchEvent {
@@ -110,6 +114,10 @@ function parseSupportedDurations(meta: { capabilities?: Record<string, unknown> 
 
 function providerCost(providerId: string, durationSec: number, resolution?: string): { amount: number; unitName: string } {
   const durationPoint = durationSec <= 5 ? 0 : durationSec <= 10 ? 1 : 2
+  if (providerId === 'doubao') {
+    // 豆包按「时长」配额：5s 扣 5 秒、10s 扣 10 秒、15s 扣 15 秒（默认每天 30s 上限）
+    return { amount: durationSec, unitName: '秒' }
+  }
   if (providerId === 'qwenwan' || providerId === 'qwen') {
     const amount = 1 + durationPoint + (resolution === '1080' ? 1 : 0)
     return { amount, unitName: '额度' }
@@ -173,13 +181,15 @@ function persistJobVideos(videos: string[], jobId: string): string[] {
   return jobVideos
 }
 
-/** 下载视频到 userData/videos/<jobId>.mp4（生成后立即落盘，避免签名 URL 过期） */
-function downloadVideo(url: string, jobId: string, providerId = 'doubao', redirects = 0): Promise<string | null> {
+/** 下载视频到 userData/videos/<jobId>.mp4（生成后立即落盘，避免签名 URL 过期）。失败时通过 onError 上报原因。 */
+export function downloadVideo(
+  url: string,
+  jobId: string,
+  providerId = 'doubao',
+  redirects = 0,
+  onError?: (reason: string) => void
+): Promise<string | null> {
   return new Promise((resolve) => {
-    if (redirects > 4) {
-      resolve(null)
-      return
-    }
     const dir = join(app.getPath('userData'), 'videos')
     mkdirSync(dir, { recursive: true })
     const file = join(dir, jobId + '.mp4')
@@ -187,13 +197,19 @@ function downloadVideo(url: string, jobId: string, providerId = 'doubao', redire
     const out = createWriteStream(tmp)
     let size = 0
     let settled = false
-    const finish = (ok: boolean, path: string | null): void => {
+    const finish = (ok: boolean, path: string | null, reason?: string): void => {
       if (settled) return
       settled = true
+      if (!ok && reason) onError?.(reason)
       try {
         out.destroy()
       } catch {}
       resolve(ok ? path : null)
+    }
+
+    if (redirects > 4) {
+      finish(false, null, `重定向超过 4 次：${url.slice(0, 160)}`)
+      return
     }
 
     const req = httpsGet(
@@ -215,12 +231,12 @@ function downloadVideo(url: string, jobId: string, providerId = 'doubao', redire
       (res) => {
         if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume()
-          void downloadVideo(res.headers.location, jobId, providerId, redirects + 1).then((p) => finish(!!p, p))
+          void downloadVideo(res.headers.location, jobId, providerId, redirects + 1, onError).then((p) => finish(!!p, p))
           return
         }
         if (!res.statusCode || res.statusCode !== 200) {
           res.resume()
-          finish(false, null)
+          finish(false, null, `HTTP ${res.statusCode ?? '无状态码'}：${url.slice(0, 160)}`)
           return
         }
         res.on('data', (c: Buffer) => {
@@ -229,24 +245,24 @@ function downloadVideo(url: string, jobId: string, providerId = 'doubao', redire
         res.pipe(out)
       }
     )
-    req.on('error', () => finish(false, null))
+    req.on('error', (e) => finish(false, null, `网络错误：${e.message}`))
     req.setTimeout(90000, () => {
       req.destroy()
-      finish(false, null)
+      finish(false, null, '下载超时（90 秒）')
     })
     out.on('finish', () => {
       if (size > 1024) {
         try {
           renameSync(tmp, file)
           finish(true, file)
-        } catch {
-          finish(false, null)
+        } catch (e) {
+          finish(false, null, `写入文件失败：${e instanceof Error ? e.message : String(e)}`)
         }
       } else {
-        finish(false, null)
+        finish(false, null, `下载内容过小（${size} 字节，可能非视频或空响应）`)
       }
     })
-    out.on('error', () => finish(false, null))
+    out.on('error', (e) => finish(false, null, `写文件错误：${e instanceof Error ? e.message : String(e)}`))
   })
 }
 
@@ -324,7 +340,7 @@ export async function runGenerate(
   emit: (event: DispatchEvent) => void,
   onJobCreated?: (jobId: string, state: { aborted: boolean; submitted: boolean }) => void,
   onQuotaUpdated?: (payload: QuotaUpdatedPayload) => void
-): Promise<{ ok: boolean; jobId?: string; error?: string }> {
+): Promise<{ ok: boolean; jobId?: string; error?: string; remoteUrl?: string | null; accountId?: string | null }> {
   if (!input.supabaseUrl || !input.supabaseAnonKey) {
     return { ok: false, error: 'Supabase 未配置' }
   }
@@ -447,6 +463,21 @@ export async function runGenerate(
         return remainingOf(b.id) - remainingOf(a.id)
       })
 
+      // 手工指定账号：校验可用性并锁定（不可用直接报错，不静默回退自动选号）
+      if (input.preferredAccountId) {
+        const preferred = providerKeys.find((k) => k.id === input.preferredAccountId)
+        const prefFail = (msg: string): { ok: false; jobId: string; error: string; accountId: string | null } => {
+          void jobSvc.updateJob(input.userId, job.id, { status: 'failed', error: msg, options: jobOptions, completedAt: new Date().toISOString() }).catch(() => {})
+          emit({ jobId: job.id, status: 'failed', message: msg })
+          return { ok: false, jobId: job.id, error: msg, accountId: input.preferredAccountId ?? null }
+        }
+        if (!preferred) return prefFail('指定的账号不存在或已解绑，请换账号或改回「自动」')
+        if (preferred.health_status === 'expired') return prefFail(`账号「${preferred.account_name || '未命名'}」登录态已失效，请换账号或改回「自动」`)
+        // 手工指定 = 人工授权：忽略当日时长上限（B 方案），仅校验账号存在与登录态
+        sorted.length = 0
+        sorted.push(preferred)
+      }
+
       const tried = new Set<string>()
       for (let round = 0; round < Math.min(providerKeys.length, 3); round++) {
         const cand = sorted.find((k) => !tried.has(k.id) && remainingOf(k.id) >= cost)
@@ -559,6 +590,7 @@ export async function runGenerate(
             keyId: cand.id,
             cancel: runCancelState,
             showWebview: input.showWebview,
+            autoConfirm: input.autoConfirm,
             onProgress: (stage, detail) =>
               emit({ jobId: job.id, status: 'running', stage, message: stage, data: detail })
           })
@@ -626,14 +658,18 @@ export async function runGenerate(
       // 状态回写失败不阻断错误返回
     }
     emit({ jobId: job.id, status: 'failed', message: err })
-    return { ok: false, jobId: job.id, error: err }
+    return { ok: false, jobId: job.id, error: err, accountId: selectedKey?.id ?? null }
   }
 
   // 2) 成功：下载落盘 → 先扣额度 → 再写 job success
   let localPath: string | null = null
+  let downloadError = ''
   try {
-    localPath = await downloadVideo(result.videoUrl, job.id, resolvedProviderId)
+    localPath = await downloadVideo(result.videoUrl, job.id, resolvedProviderId, 0, (r) => {
+      downloadError = r
+    })
   } catch (e) {
+    downloadError = e instanceof Error ? e.message : String(e)
     emit({
       jobId: job.id,
       status: 'running',
@@ -696,7 +732,7 @@ export async function runGenerate(
       completedAt: new Date().toISOString()
     })
     emit({ jobId: job.id, status: 'failed', message: errMsg })
-    return { ok: false, jobId: job.id, error: errMsg }
+    return { ok: false, jobId: job.id, error: errMsg, accountId: selectedKey?.id ?? null }
   }
 
   await jobSvc.updateJob(input.userId, job.id, {
@@ -711,6 +747,7 @@ export async function runGenerate(
       ...jobOptions,
       remoteUrl: result.videoUrl,
       localPath: localPath || null,
+      downloadError: downloadError || null,
       cleanLocalPath: null,
       originalLocalPath: localPath || null,
       watermarkStatus: 'none',
@@ -729,7 +766,7 @@ export async function runGenerate(
     data: { resultUrl, cost, localPath, accountId: selectedKey?.id ?? null }
   })
 
-  return { ok: true, jobId: job.id }
+  return { ok: true, jobId: job.id, remoteUrl: result.videoUrl, accountId: selectedKey?.id ?? null }
 }
 
 /**

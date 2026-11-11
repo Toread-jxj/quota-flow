@@ -1,18 +1,22 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import type { AuthUser } from '../hooks/useAuth'
 import type { StoryboardParseResult, StoryboardShot, GenerateRequest } from '../../../preload'
 import { getSupabaseConfig, getAuthService } from '../auth/service'
+import type { ProvidersResult } from '../hooks/useProviders'
+import Select from './Select'
 import { IconSparkles } from './icons'
+import { getInitialShowWebview } from './Modals'
 
 interface StoryboardEditorProps {
   user: AuthUser
+  providers: ProvidersResult
   onToast?: (msg: string) => void
 }
 
 type ShotStatus = 'pending' | 'running' | 'done' | 'error'
 
 /** 组装 runGenerate 需要的输入（复用桌面端登录态 + Supabase 上下文） */
-async function buildGen(user: AuthUser, shot: StoryboardShot): Promise<GenerateRequest | null> {
+async function buildGen(user: AuthUser, shot: StoryboardShot, preferredAccountId?: string | null, opts?: { autoConfirm?: boolean }): Promise<GenerateRequest | null> {
   const cfg = getSupabaseConfig()
   const auth = getAuthService()
   if (!cfg || !auth) return null
@@ -30,11 +34,14 @@ async function buildGen(user: AuthUser, shot: StoryboardShot): Promise<GenerateR
     mode: shot.images.length > 0 ? 'img2video' : 'text2video',
     images: shot.images,
     audio: 'on',
-    ratio: '16:9'
+    ratio: '16:9',
+    showWebview: getInitialShowWebview(),
+    preferredAccountId: preferredAccountId || null,
+    autoConfirm: opts?.autoConfirm || false
   }
 }
 
-export default function StoryboardEditor({ user, onToast }: StoryboardEditorProps) {
+export default function StoryboardEditor({ user, providers, onToast }: StoryboardEditorProps) {
   const [workDir, setWorkDir] = useState('')
   const [result, setResult] = useState<StoryboardParseResult | null>(null)
   const [statusMap, setStatusMap] = useState<Record<number, ShotStatus>>({})
@@ -42,6 +49,18 @@ export default function StoryboardEditor({ user, onToast }: StoryboardEditorProp
   const [generating, setGenerating] = useState(false)
   const [finalVideo, setFinalVideo] = useState<string | null>(null)
   const [merging, setMerging] = useState(false)
+  const [confirmRegen, setConfirmRegen] = useState<number | null>(null)
+  const [retryInfo, setRetryInfo] = useState<Record<number, { jobId: string; remoteUrl: string }>>({})
+  const [openInfo, setOpenInfo] = useState<Record<number, string>>({})
+  const [openedPage, setOpenedPage] = useState<number | null>(null)
+  const [retryMsg, setRetryMsg] = useState<Record<number, string>>({})
+  const [preferredAccountId, setPreferredAccountId] = useState('')
+  const [manualUrlFor, setManualUrlFor] = useState<number | null>(null)
+  const [manualUrlValue, setManualUrlValue] = useState('')
+  const [videoPickerFor, setVideoPickerFor] = useState<number | null>(null)
+  const [videoPickerList, setVideoPickerList] = useState<Array<{ src: string; poster?: string }>>([])
+
+  const doubaoKeys = useMemo(() => providers.aggs.find((a) => a.providerId === 'doubao')?.bindings ?? [], [providers.aggs])
 
   const pickDir = useCallback(async () => {
     const r = await window.api.storyboard.pickDir()
@@ -60,7 +79,31 @@ export default function StoryboardEditor({ user, onToast }: StoryboardEditorProp
     if (r.ok && r.result) {
       setResult(r.result)
       const m: Record<number, ShotStatus> = {}
+      const v: Record<number, string> = {}
+      const ri: Record<number, { jobId: string; remoteUrl: string }> = {}
+      const oi: Record<number, string> = {}
       r.result.shots.forEach((s) => { m[s.index] = 'pending' })
+      // 恢复进度：已生成的关联视频、有 remoteUrl 的标记可补下载、有 accountId 的标记可打开豆包
+      const progress = r.result.progress || {}
+      Object.entries(progress).forEach(([idxStr, p]) => {
+        const idx = Number(idxStr)
+        if (p.videoPath) {
+          v[idx] = p.videoPath
+          m[idx] = 'done'
+        } else {
+          // 文件丢失：同时提供「补下载」（有 remoteUrl+jobId）和「打开豆包」（有 accountId）两个兜底
+          if (p.remoteUrl && p.jobId) {
+            ri[idx] = { jobId: p.jobId, remoteUrl: p.remoteUrl }
+          }
+          if (p.accountId) {
+            oi[idx] = p.accountId
+          }
+          m[idx] = 'error'
+        }
+      })
+      setVideos(v)
+      setRetryInfo(ri)
+      setOpenInfo(oi)
       setStatusMap(m)
       onToast?.(`解析完成：${r.result.shots.length} 段分镜`)
     } else {
@@ -69,11 +112,12 @@ export default function StoryboardEditor({ user, onToast }: StoryboardEditorProp
   }, [workDir, onToast])
 
   const generateOne = useCallback(
-    async (shot: StoryboardShot) => {
+    async (shot: StoryboardShot, opts?: { isBatch?: boolean }) => {
+      const isBatch = opts?.isBatch === true
       if (!result) return
       setStatusMap((m) => ({ ...m, [shot.index]: 'running' as ShotStatus }))
       try {
-        const gen = await buildGen(user, shot)
+        const gen = await buildGen(user, shot, preferredAccountId || null, { autoConfirm: isBatch })
         if (!gen) {
           onToast?.('未获取到登录态')
           setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
@@ -88,6 +132,31 @@ export default function StoryboardEditor({ user, onToast }: StoryboardEditorProp
           setVideos((v) => ({ ...v, [shot.index]: r.videoPath! }))
           setStatusMap((m) => ({ ...m, [shot.index]: 'done' as ShotStatus }))
         } else {
+          if (r.jobId && r.remoteUrl) {
+            setRetryInfo((m) => ({ ...m, [shot.index]: { jobId: r.jobId!, remoteUrl: r.remoteUrl! } }))
+          }
+          if (r.accountId) {
+            setOpenInfo((m) => ({ ...m, [shot.index]: r.accountId! }))
+            if (!r.remoteUrl && !isBatch) {
+              // 批量模式跳过自动拉取：避免拖慢批量 + 拉取串台，失败留给批量结束后的手动兜底
+              setRetryMsg((m) => ({ ...m, [shot.index]: '自动拉取中…' }))
+              onToast?.(`分镜 ${shot.index} 生成失败，自动拉取豆包最新视频中…`)
+              const auto = await window.api.storyboard.autoRetry({ keyId: r.accountId, batchDir: result.batchDir, index: shot.index, maxAttempts: 3 })
+              if (auto.ok && auto.videoPath) {
+                setVideos((v) => ({ ...v, [shot.index]: auto.videoPath! }))
+                setStatusMap((m) => ({ ...m, [shot.index]: 'done' as ShotStatus }))
+                setRetryMsg((m) => {
+                  const n = { ...m }
+                  delete n[shot.index]
+                  return n
+                })
+                onToast?.(`分镜 ${shot.index} 自动拉取成功`)
+                return
+              }
+              setRetryMsg((m) => ({ ...m, [shot.index]: '自动拉取失败，请手动处理' }))
+              onToast?.(`分镜 ${shot.index} 自动拉取失败，请手动处理`)
+            }
+          }
           onToast?.(`分镜 ${shot.index} 失败：${r.error || '未知'}`)
           setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
         }
@@ -96,7 +165,140 @@ export default function StoryboardEditor({ user, onToast }: StoryboardEditorProp
         setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
       }
     },
-    [result, user, onToast]
+    [result, user, onToast, preferredAccountId]
+  )
+
+  const retryDownload = useCallback(
+    async (shot: StoryboardShot) => {
+      if (!result) return
+      const info = retryInfo[shot.index]
+      if (!info) return
+      setStatusMap((m) => ({ ...m, [shot.index]: 'running' as ShotStatus }))
+      try {
+        const r = await window.api.storyboard.reDownload({
+          remoteUrl: info.remoteUrl,
+          jobId: info.jobId,
+          batchDir: result.batchDir,
+          index: shot.index
+        })
+        if (r.ok && r.videoPath) {
+          setVideos((v) => ({ ...v, [shot.index]: r.videoPath! }))
+          setStatusMap((m) => ({ ...m, [shot.index]: 'done' as ShotStatus }))
+          setRetryInfo((m) => {
+            const n = { ...m }
+            delete n[shot.index]
+            return n
+          })
+        } else {
+          onToast?.(`补下载失败：${r.error || '未知'}`)
+          setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
+        }
+      } catch (e) {
+        onToast?.(`补下载异常：${e instanceof Error ? e.message : String(e)}`)
+        setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
+      }
+    },
+    [result, retryInfo, onToast]
+  )
+
+  const openDoubao = useCallback(
+    async (shot: StoryboardShot) => {
+      const keyId = openInfo[shot.index]
+      const r = await window.api.storyboard.openDoubaoPage({ keyId })
+      if (!r.ok) onToast?.(`打开豆包失败：${r.error || '未知'}`)
+      else setOpenedPage(shot.index)
+    },
+    [openInfo, onToast]
+  )
+
+  const downloadLatest = useCallback(
+    async (shot: StoryboardShot) => {
+      if (!result) return
+      const keyId = openInfo[shot.index]
+      setStatusMap((m) => ({ ...m, [shot.index]: 'running' as ShotStatus }))
+      try {
+        const r = await window.api.storyboard.downloadLatest({ keyId, batchDir: result.batchDir, index: shot.index })
+        if (r.ok && r.videoPath) {
+          setVideos((v) => ({ ...v, [shot.index]: r.videoPath! }))
+          setStatusMap((m) => ({ ...m, [shot.index]: 'done' as ShotStatus }))
+          onToast?.(`分镜 ${shot.index} 已下载`)
+        } else {
+          onToast?.(`下载最新失败：${r.error || '未知'}`)
+          setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
+        }
+      } catch (e) {
+        onToast?.(`下载最新异常：${e instanceof Error ? e.message : String(e)}`)
+        setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
+      }
+    },
+    [result, openInfo, onToast]
+  )
+
+  const manualDownload = useCallback(
+    async (shot: StoryboardShot) => {
+      if (!result) return
+      const url = manualUrlValue.trim()
+      if (!url) {
+        onToast?.('请先填写视频 URL')
+        return
+      }
+      setStatusMap((m) => ({ ...m, [shot.index]: 'running' as ShotStatus }))
+      try {
+        const r = await window.api.storyboard.manualDownload({ url, batchDir: result.batchDir, index: shot.index })
+        if (r.ok && r.videoPath) {
+          setVideos((v) => ({ ...v, [shot.index]: r.videoPath! }))
+          setStatusMap((m) => ({ ...m, [shot.index]: 'done' as ShotStatus }))
+          setManualUrlFor(null)
+          setManualUrlValue('')
+          onToast?.(`分镜 ${shot.index} 已从 URL 下载`)
+        } else {
+          onToast?.(`手动下载失败：${r.error || '未知'}`)
+          setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
+        }
+      } catch (e) {
+        onToast?.(`手动下载异常：${e instanceof Error ? e.message : String(e)}`)
+        setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
+      }
+    },
+    [result, manualUrlValue, onToast]
+  )
+
+  const pickVideo = useCallback(
+    async (shot: StoryboardShot) => {
+      const keyId = openInfo[shot.index]
+      const r = await window.api.storyboard.listVideos({ keyId })
+      if (!r.ok || !r.videos || r.videos.length === 0) {
+        onToast?.(r.error || '未提取到视频')
+        return
+      }
+      setVideoPickerList(r.videos)
+      setVideoPickerFor(shot.index)
+    },
+    [openInfo, onToast]
+  )
+
+  const downloadPickedVideo = useCallback(
+    async (shot: StoryboardShot, url: string) => {
+      if (!result) return
+      setVideoPickerFor(null)
+      setVideoPickerList([])
+      setStatusMap((m) => ({ ...m, [shot.index]: 'running' as ShotStatus }))
+      try {
+        const r = await window.api.storyboard.manualDownload({ url, batchDir: result.batchDir, index: shot.index })
+        if (r.ok && r.videoPath) {
+          setVideos((v) => ({ ...v, [shot.index]: r.videoPath! }))
+          setStatusMap((m) => ({ ...m, [shot.index]: 'done' as ShotStatus }))
+          onToast?.(`分镜 ${shot.index} 已下载所选视频`)
+        } else {
+          onToast?.(`下载失败：${r.error || '未知'}`)
+          setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
+        }
+      } catch (e) {
+        onToast?.(`下载异常：${e instanceof Error ? e.message : String(e)}`)
+        setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
+      }
+    },
+    [result, onToast]
   )
 
   const generateAll = useCallback(async () => {
@@ -104,7 +306,7 @@ export default function StoryboardEditor({ user, onToast }: StoryboardEditorProp
     setGenerating(true)
     // 串行生成，避免 WebView 并发冲突
     for (const shot of result.shots) {
-      await generateOne(shot)
+      await generateOne(shot, { isBatch: true })
     }
     setGenerating(false)
   }, [result, generating, generateOne])
@@ -131,17 +333,33 @@ export default function StoryboardEditor({ user, onToast }: StoryboardEditorProp
   return (
     <div className="storyboard-editor">
       <div className="storyboard-toolbar">
-        <button className="btn" onClick={pickDir}>
+        <button className="btn btn-primary" onClick={pickDir}>
           1. 选择工作目录
         </button>
-        <button className="btn" onClick={parse} disabled={!workDir}>
+        <span className="step-arrow" aria-hidden="true">→</span>
+        <button className="btn btn-primary" onClick={parse} disabled={!workDir}>
           2. 解析分镜词 + 匹配资源
         </button>
-        <button className="btn btn-primary" onClick={generateAll} disabled={!result || generating}>
-          {generating ? `生成中 ${doneCount}/${total}` : '3. 生成全部片段'}
+        <span className="step-arrow" aria-hidden="true">→</span>
+        <button className="btn btn-primary" onClick={merge} disabled={doneCount === 0 || merging}>
+          {merging ? '合并中…' : '3. 合并成片'}
         </button>
-        <button className="btn" onClick={merge} disabled={doneCount === 0 || merging}>
-          {merging ? '合并中…' : '4. 合并成片'}
+        <span className="step-divider" aria-hidden="true" />
+        <Select
+          value={preferredAccountId}
+          onChange={setPreferredAccountId}
+          options={[
+            { value: '', label: '账号：自动' },
+            ...doubaoKeys.map((k) => ({
+              value: k.keyId,
+              label: `${k.accountName}（剩 ${k.remaining}秒）${k.health === 'expired' ? '｜已失效' : k.health === 'expiring' ? '｜即将过期' : ''}`,
+              disabled: k.health === 'expired'
+            }))
+          ]}
+          style={{ minWidth: 210 }}
+        />
+        <button className="btn" onClick={generateAll} disabled={!result || generating} title="跳过逐段审核，一次生成全部片段（备用）">
+          {generating ? `批量生成中 ${doneCount}/${total}` : '批量生成全部'}
         </button>
       </div>
 
@@ -151,6 +369,12 @@ export default function StoryboardEditor({ user, onToast }: StoryboardEditorProp
         {result && <span>｜共 {total} 段</span>}
         {result && <span>｜完成 {doneCount}</span>}
       </div>
+
+      {result && (
+        <div className="storyboard-hint">
+          逐段审核下方分镜词与匹配资源，点每段的「生成」按钮单段生成；确认无误可点上方「批量生成全部」。
+        </div>
+      )}
 
       {finalVideo && (
         <div className="storyboard-final">
@@ -172,16 +396,110 @@ export default function StoryboardEditor({ user, onToast }: StoryboardEditorProp
                   <span className="shot-title">{shot.title}</span>
                   <span className="shot-dur">{shot.durationSec}s</span>
                   <button
-                    className="btn btn-sm"
-                    onClick={() => generateOne(shot)}
+                    className="btn btn-sm btn-primary"
+                    onClick={() => {
+                      if (st === 'done' && confirmRegen !== shot.index) {
+                        setConfirmRegen(shot.index)
+                        return
+                      }
+                      setConfirmRegen(null)
+                      void generateOne(shot)
+                    }}
                     disabled={st === 'running' || generating}
                   >
-                    {st === 'done' ? '重生成' : st === 'running' ? '生成中…' : '生成'}
+                    {st === 'done'
+                      ? confirmRegen === shot.index
+                        ? '确认重生成？'
+                        : '✓ 重生成'
+                      : st === 'running'
+                        ? '生成中…'
+                        : '生成'}
                   </button>
+                  {retryMsg[shot.index] && (
+                    <span className="shot-retry-msg">{retryMsg[shot.index]}</span>
+                  )}
                   <span className={`shot-status status-${st}`}>
                     {st === 'done' ? '✓' : st === 'running' ? '…' : st === 'error' ? '✗' : '待'}
                   </span>
+                  {st === 'error' && retryInfo[shot.index] && (
+                    <button className="btn btn-sm" onClick={() => void retryDownload(shot)} disabled={generating}>
+                      补下载
+                    </button>
+                  )}
+                  {st === 'error' && (
+                    <button className="btn btn-sm" onClick={() => void openDoubao(shot)} disabled={generating}>
+                      打开豆包
+                    </button>
+                  )}
+                  {st === 'error' && openedPage === shot.index && (
+                    <button className="btn btn-sm" onClick={() => void downloadLatest(shot)} disabled={generating}>
+                      下载最新
+                    </button>
+                  )}
+                  {st === 'error' && openedPage === shot.index && (
+                    <button className="btn btn-sm" onClick={() => void pickVideo(shot)} disabled={generating}>
+                      选视频
+                    </button>
+                  )}
+                  {st === 'error' && (
+                    <button
+                      className="btn btn-sm"
+                      onClick={() => {
+                        setManualUrlFor(shot.index)
+                        setManualUrlValue('')
+                      }}
+                      disabled={generating}
+                    >
+                      手动填 URL
+                    </button>
+                  )}
                 </div>
+
+                {manualUrlFor === shot.index && (
+                  <div className="shot-manual-url">
+                    <input
+                      type="text"
+                      value={manualUrlValue}
+                      onChange={(e) => setManualUrlValue(e.target.value)}
+                      placeholder="粘贴视频 URL（http/https）"
+                    />
+                    <button className="btn btn-sm btn-primary" onClick={() => void manualDownload(shot)} disabled={generating}>
+                      下载
+                    </button>
+                    <button
+                      className="btn btn-sm"
+                      onClick={() => {
+                        setManualUrlFor(null)
+                        setManualUrlValue('')
+                      }}
+                    >
+                      取消
+                    </button>
+                  </div>
+                )}
+
+                {videoPickerFor === shot.index && (
+                  <div className="shot-video-picker">
+                    <div className="picker-title">选择要下载的视频（从旧到新）：</div>
+                    <div className="picker-list">
+                      {videoPickerList.map((v, i) => (
+                        <div key={i} className="picker-item" onClick={() => void downloadPickedVideo(shot, v.src)}>
+                          {v.poster ? <img src={v.poster} className="picker-thumb" alt="" /> : <span className="picker-nothumb">无封面</span>}
+                          <span className="picker-index">第 {i + 1} 个</span>
+                        </div>
+                      ))}
+                    </div>
+                    <button
+                      className="btn btn-sm"
+                      onClick={() => {
+                        setVideoPickerFor(null)
+                        setVideoPickerList([])
+                      }}
+                    >
+                      取消
+                    </button>
+                  </div>
+                )}
 
                 {shot.images.length > 0 && (
                   <div className="shot-images">
@@ -206,7 +524,18 @@ export default function StoryboardEditor({ user, onToast }: StoryboardEditorProp
                 )}
 
                 {videos[shot.index] && (
-                  <video src={`file://${videos[shot.index]}`} controls className="shot-video" />
+                  <>
+                    <video src={`file://${videos[shot.index]}`} controls className="shot-video" />
+                    <div className="shot-video-path">
+                      <span className="path-text" title={videos[shot.index]}>{videos[shot.index]}</span>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => void window.api.media.showInFolder(videos[shot.index], workDir)}
+                      >
+                        打开所在文件夹
+                      </button>
+                    </div>
+                  </>
                 )}
               </div>
             )

@@ -36,17 +36,6 @@ export interface StoryboardParseResult {
 }
 
 // ---- 常量 ----
-const VOICE: Record<string, string> = {
-  NORA: '38岁英国女性，克制清楚',
-  EVAN: '32岁英国男性，自然中低音、疲惫但不冷漠',
-  RUTH: '58岁英国女性，清晰平稳',
-  HELEN: '约60岁女性，亲切普通',
-  TOM: '约70岁男性，平常含蓄'
-}
-
-const STYLE_PREFIX =
-  '16:9横屏，欧美真人写实，自然速度，固定机位无镜头运动。自然皮肤细节、可信重量与真实尺度材质，宽而柔和明暗，低对比、克制锐度，无游戏渲染。'
-
 const DUR_SLOTS = [5, 10, 15]
 
 function snapDuration(d: number): number {
@@ -134,20 +123,14 @@ function parseSegment(body: string): {
   return { scene, shots, dials, refs }
 }
 
-// ---- 照抄拼接版 prompt ----
-function buildRawPrompt(
-  scene: string,
-  lens: ParsedLens[],
-  dials: ParsedDial[],
-  refLabels: string[]
-): string {
-  const act = lens.map((s) => s.action).filter(Boolean).join(' ')
-  const dial = dials.map((d) => `${d.role}（${VOICE[d.role] || ''}）说：“${d.line}”`).join(' ')
-  const imgs = refLabels.map((l, i) => `[图${i + 1}：${l}]`).join(' ')
-  const lines = [STYLE_PREFIX, `场景：${scene}。`, `动作：${act}`]
-  if (dial) lines.push(`对白：${dial}`)
-  if (imgs) lines.push(`参考图：${imgs}`)
-  return lines.join('\n')
+// ---- 照抄版 prompt（方向2：整段原文照抄，仅把 @资产引用 替换成 [图N：标签]，不做重组/过滤）----
+function buildRawPrompt(body: string, refs: string[], refLabels: string[]): string {
+  let prompt = body
+  refs.forEach((ref, i) => {
+    const label = refLabels[i] || ref
+    prompt = prompt.split('@' + ref).join(`[图${i + 1}：${label}]`)
+  })
+  return prompt
 }
 
 // ---- 主解析：文本 → 结构化 shots（默认 raw）----
@@ -182,7 +165,7 @@ export function parseStoryboardText(text: string): StoryboardShot[] {
       dialogue: dialsField.map((x) => ({ role: x.role, line: x.line })),
       refs,
       images: [],
-      prompt: buildRawPrompt(scene, l, dialsField, refLabels)
+      prompt: buildRawPrompt(body, refs, refLabels)
     })
 
     if (dur <= 15 || lens.length <= 1) {

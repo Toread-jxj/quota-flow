@@ -71,6 +71,8 @@ export interface DoubaoGenerateOptions {
   maxWaitSec?: number
   /** 取消/已提交状态：主进程注册表持有，提交前检查 aborted，提交后置 submitted */
   cancel?: { aborted: boolean; submitted: boolean }
+  /** 批量模式自动确认：豆包以「聊天回复」要求确认参数时，自动回「确认」而不弹窗人工确认 */
+  autoConfirm?: boolean
   onProgress?: (stage: string, detail?: unknown) => void
 }
 
@@ -205,17 +207,25 @@ const uploadImagesScript = (dataUrls: string[]): unknown => {
     input.dispatchEvent(new Event('input', { bubbles: true }))
     // 等待上传完成：等「上传中/压缩中」文案消失后再多等 2s（粗略判定）
     let done = false
-    for (let w = 0; w < 40; w++) {
-      await sleep(750)
+    let stable = 0
+    for (let w = 0; w < 60; w++) {
+      await sleep(500)
       if (window.__qfUploadCancel) {
         return { ok: false, cancelled: true, reason: '已手动终止生成（提示词未发送）' }
       }
       const text = document.body ? document.body.innerText : ''
       const pending = /上传中|正在上传|压缩中|处理中/.test(text)
-      if (w > 12 && !pending) {
-        await sleep(2000)
-        done = true
-        break
+      if (pending) {
+        stable = 0
+      } else {
+        stable++
+        // 连续 1.5s（3 次×500ms）无「上传中」且已过最小等待（w>=2）才判上传完成；
+        // 多张图连续上传时中间可能短暂无文案，靠「连续稳定」避免误判过早提交（高峰页面慢也不误判）。
+        if (stable >= 3 && w >= 2) {
+          await sleep(1000)
+          done = true
+          break
+        }
       }
     }
     results.push({ ok: done, count: files.length })
@@ -319,72 +329,6 @@ const insertPromptAndSubmitScript = (prompt: string): unknown => {
 const detectConfirmRequestScript = (): boolean => {
   const t = document.body ? document.body.innerText : ''
   return /确认后我再开始生成视频|我将按最终要求生成|视频生成参数确认|确认以上参数|请确认以上方案/.test(t)
-}
-
-// 校验自动回复的确认消息是否真的落进了聊天区（豆包可能没把输入推进去，需据此重试）。
-const confirmReplySentScript = (marker: string): boolean => {
-  const t = document.body ? document.body.innerText : ''
-  return t.includes(marker)
-}
-
-// 向豆包输入框追加一段文本并回车（不清空输入框，避免误删已上传图片/内容），用于回复「确认开始生成」。
-const appendAndSubmitTextScript = (text: string): unknown => {
-  const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
-  const findEditor = (): HTMLElement | null => {
-    const sels = ['[class*="ProseMirror"]', '[class*="tiptap"]', '[contenteditable="true"]', '[contenteditable="plaintext-only"]', '[role="textbox"]']
-    for (const s of sels) {
-      const els = [...document.querySelectorAll<HTMLElement>(s)]
-      // 优先可见输入框；生成过程中输入框可能被收起，offsetParent 为 null，此时回退到任意匹配的第一个。
-      const visible = els.find((el) => el.offsetParent !== null)
-      if (visible) return visible
-      if (els.length) return els[0]
-    }
-    return null
-  }
-  return (async () => {
-    const editor = findEditor()
-    if (!editor) return { ok: false, reason: '未找到输入框' }
-    // 主动唤起输入（有些 UI 要点击展开，否则 insertText 进不到被折叠的编辑器）
-    try { (editor as HTMLElement).click() } catch {}
-    editor.focus()
-    try {
-      const sel = window.getSelection()
-      if (sel) {
-        const range = document.createRange()
-        range.selectNodeContents(editor)
-        range.collapse(false)
-        sel.removeAllRanges()
-        sel.addRange(range)
-      }
-    } catch {}
-    try {
-      document.execCommand('insertText', false, text)
-    } catch {}
-    editor.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: text }))
-    editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }))
-    await sleep(800)
-    // 校验插入是否成功，失败则换 TipTap setContent（替换式，仅兜底，确认消息无图片依赖）
-    const norm = (s: string): string => (s || '').trim()
-    if (!norm(editor.innerText || editor.textContent || '').includes(text.trim())) {
-      try {
-        const tiptap = (window as unknown as Record<string, { commands?: { setContent?: (c: string, e?: boolean) => void } }>)[Object.keys(window).find((k) => {
-          try {
-            const v = (window as unknown as Record<string, unknown>)[k]
-            return !!v && typeof v === 'object' && !!((v as { commands?: unknown }).commands) && typeof ((v as { commands?: { setContent?: unknown } }).commands?.setContent) === 'function'
-          } catch { return false }
-        }) || '']
-        if (tiptap && tiptap.commands?.setContent) tiptap.commands.setContent(text, false)
-      } catch {}
-      await sleep(400)
-    }
-    editor.focus()
-    const enterOpts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }
-    editor.dispatchEvent(new KeyboardEvent('keydown', enterOpts))
-    editor.dispatchEvent(new KeyboardEvent('keypress', enterOpts))
-    editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }))
-    await sleep(1500)
-    return { ok: true }
-  })()
 }
 
 // 填入 prompt：先清空编辑器（ProseMirror 可能含时长 chip），再插入干净文本，校验后回车提交
@@ -1261,8 +1205,8 @@ const riskProbeScript = (): unknown => {
     const mo = new MutationObserver(() => {
       try {
         const t = document.body ? document.body.innerText : ''
-        const riskShown = /安全验证|滑块验证|请完成验证|拖动滑块|人机验证|完成验证|验证码/.test(t) ||
-          document.querySelector('[class*="captcha" i], [class*="verify" i], iframe[src*="captcha" i]')
+        const riskShown = /安全验证|滑块验证|请完成验证|拖动滑块|人机验证|验证码/.test(t) ||
+          document.querySelector('[class*="captcha" i], iframe[src*="captcha" i]')
         // 免责/安全确认弹窗：只标记为 disclaimer（实时），不进持久 verify，避免窗口点完不恢复
         const disclaimerShown = /免责声明|安全确认|充分授权|素材授权|内容授权/.test(t)
         if (disclaimerShown) {
@@ -1287,7 +1231,7 @@ const readRiskScript = (): unknown => {
   let disclaimer = false
   try {
     const t = document.body ? document.body.innerText : ''
-    if (/安全验证|滑块验证|请完成验证|拖动滑块|人机验证|完成验证/.test(t)) domVerify = true
+    if (/安全验证|滑块验证|请完成验证|拖动滑块|人机验证|验证码/.test(t)) domVerify = true
     // 免责/安全确认弹窗：完全由实时 DOM 判断（弹窗消失即不再命中），避免类型残留导致窗口不恢复
     if (/免责声明|安全确认|充分授权|素材授权|内容授权/.test(t)) disclaimer = true
     if (document.querySelector('[class*="captcha" i], iframe[src*="captcha" i]')) domVerify = true
@@ -1638,6 +1582,18 @@ export async function runDoubaoGeneration(options: DoubaoGenerateOptions): Promi
     const aborted = abortIfCancelled()
     if (aborted) return aborted
   }
+  // 提交前记录页面已有视频（baseline），生成后只提取本次新增的视频，避免取到聊天历史里的旧视频
+  const baseline = new Set<string>()
+  try {
+    const pre = (await win.webContents.executeJavaScript('(' + extractResultScript.toString() + ')()', true)) as {
+      vids?: Array<{ src: string }>
+      mp4s?: string[]
+    }
+    for (const v of pre.vids ?? []) if (v.src) baseline.add(v.src)
+    for (const m of pre.mp4s ?? []) baseline.add(m)
+  } catch {
+    // baseline 采集失败不阻断，退化为原「取第一个」逻辑
+  }
   progress(options, 'submit')
   let fillResult: { ok?: boolean; reason?: string } = {}
   const isImg2Video = options.mode === 'img2video'
@@ -1735,7 +1691,7 @@ export async function runDoubaoGeneration(options: DoubaoGenerateOptions): Promi
   }
   let riskMode = false
   let riskSince = 0
-  const RISK_TIMEOUT_MS = 300000 // 风控验证等待上限：5 分钟
+  const RISK_TIMEOUT_MS = 900000 // 风控/确认验证等待上限：15 分钟（给足人工确认/修改提示词的时间）
   if (risk.type === 'verify') {
     riskMode = true
     riskSince = Date.now()
@@ -1757,12 +1713,11 @@ export async function runDoubaoGeneration(options: DoubaoGenerateOptions): Promi
   }
 
   progress(options, 'waiting')
-  const maxWaitMs = (options.maxWaitSec ?? 360) * 1000
+  const maxWaitMs = (options.maxWaitSec ?? 900) * 1000
   const started = Date.now()
   let cardClicked = false
   let doneTicks = 0
-  let confirmReplied = false
-  let confirmReplyAttempts = 0
+  let confirmShown = false
   let final: { videoUrl?: string; posterUrl?: string | null } | null = null
 
   while (Date.now() - started < maxWaitMs) {
@@ -1813,10 +1768,9 @@ export async function runDoubaoGeneration(options: DoubaoGenerateOptions): Promi
       win.destroy()
       return failBlocked(r.blockedText)
     }
-    // 豆包以「聊天回复」要求确认参数（视频未开始生成）：回一条「确认，直接开始生成」推进。
-    // 每次轮询校验确认消息是否真的落进聊天区，没落地就一直补发（最多 confirmReplyAttempts 次)，
-    // 落地后才真正标记已确认，避免「发失败却被当成功」导致一直卡在确认上。
-    if (!confirmReplied && confirmReplyAttempts < 3) {
+    // 豆包以「聊天回复」要求确认参数（视频未开始生成）：弹窗交用户手动确认/修改提示词，不自动回复。
+    // 用户可在窗口中查看提示词、直接对话修正后确认；确认后视频开始生成，轮询提取 URL。
+    if (!confirmShown) {
       let needConfirm = false
       try {
         needConfirm = (await win.webContents.executeJavaScript('(' + detectConfirmRequestScript.toString() + ')()', true)) as boolean
@@ -1824,26 +1778,30 @@ export async function runDoubaoGeneration(options: DoubaoGenerateOptions): Promi
         needConfirm = false
       }
       if (needConfirm) {
-        let landed = false
-        try {
-          landed = (await win.webContents.executeJavaScript('(' + confirmReplySentScript.toString() + ')(' + JSON.stringify('确认，直接开始生成') + ')', true)) as boolean
-        } catch {
-          landed = false
-        }
-        if (!landed) {
-          confirmReplyAttempts += 1
-          progress(options, 'waiting', { message: '豆包要求确认参数，自动确认中...（第 ' + confirmReplyAttempts + ' 次）' })
+        confirmShown = true
+        if (options.autoConfirm) {
+          // 批量模式：自动回「确认，直接开始生成」，不弹窗人工确认
+          progress(options, 'risk-verify', { message: '豆包要求确认参数，已自动确认' })
           try {
-            await win.webContents.executeJavaScript('(' + appendAndSubmitTextScript.toString() + ')(' + JSON.stringify('确认，直接开始生成') + ')', true)
-          } catch {}
+            const confirmRes = (await win.webContents.executeJavaScript('(' + fillAndSubmitScript.toString() + ')(' + JSON.stringify('确认，直接开始生成') + ')', true)) as { ok?: boolean; reason?: string } | undefined
+            if (!confirmRes || confirmRes.ok !== true) {
+              // 自动确认失败（未找到输入框 / 内容未写入）→ 弹窗交人工兜底
+              showRiskWindow(win)
+              progress(options, 'risk-verify', { message: '自动确认失败，请在窗口中手动确认' })
+            }
+          } catch {
+            // 自动确认脚本异常则弹窗交人工兜底
+            showRiskWindow(win)
+            progress(options, 'risk-verify', { message: '自动确认失败，请在窗口中手动确认' })
+          }
         } else {
-          // 确认消息已落进聊天区（含用户手动确认的情况），标记处理完成避免重复发送。
-          confirmReplied = true
+          showRiskWindow(win)
+          progress(options, 'risk-verify', { message: '豆包要求确认参数，请在窗口中查看提示词，如需修改请直接对话修正后确认' })
         }
       }
     }
-    const video = r.vids && r.vids[0]
-    const mp4 = r.mp4s && r.mp4s[0]
+    const video = r.vids && r.vids.find((v) => v.src && !baseline.has(v.src))
+    const mp4 = r.mp4s && r.mp4s.find((m) => !baseline.has(m))
     if (video && video.src) {
       final = { videoUrl: video.src, posterUrl: video.poster || null }
       break
@@ -1876,5 +1834,131 @@ export async function runDoubaoGeneration(options: DoubaoGenerateOptions): Promi
     videoUrl: final.videoUrl,
     posterUrl: final.posterUrl ?? null,
     attempts
+  }
+}
+
+/** 打开的豆包窗口引用（keyId → 窗口），供「下载最新」时从窗口提取视频。 */
+const openDoubaoWindows = new Map<string, BrowserWindow>()
+
+/** 打开豆包页面（供自动化失败时人工兜底）。复用持久化分区登录态；窗口引用保存供后续提取下载。 */
+export function openDoubaoPage(keyId?: string): { ok: boolean; error?: string } {
+  const partition = keyId ? `persist:qf-p:doubao:${keyId}` : PARTITION
+  const winKey = keyId ?? PARTITION
+  const existing = openDoubaoWindows.get(winKey)
+  if (existing && !existing.isDestroyed()) {
+    existing.show()
+    existing.focus()
+    return { ok: true }
+  }
+  const win = new BrowserWindow({
+    show: true,
+    width: 1280,
+    height: 900,
+    title: '豆包页面 - Quota-Flow',
+    autoHideMenuBar: true,
+    backgroundColor: '#0c0c0c',
+    webPreferences: {
+      partition,
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
+    }
+  })
+  win.webContents.setUserAgent(UA)
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('http')) return { action: 'allow', overrideBrowserWindowOptions: { width: 560, height: 720 } }
+    return { action: 'deny' }
+  })
+  openDoubaoWindows.set(winKey, win)
+  win.on('closed', () => {
+    if (openDoubaoWindows.get(winKey) === win) openDoubaoWindows.delete(winKey)
+  })
+  void win.loadURL(DOUBAO_URL)
+  return { ok: true }
+}
+
+/** 从已打开的豆包窗口提取最新视频 URL（人工看到视频后手动触发下载用）。 */
+export async function extractLatestDoubaoVideoUrl(keyId?: string): Promise<{ ok: boolean; videoUrl?: string; error?: string }> {
+  const winKey = keyId ?? PARTITION
+  const win = openDoubaoWindows.get(winKey)
+  if (!win || win.isDestroyed()) return { ok: false, error: '豆包窗口未打开，请先点「打开豆包」' }
+  try {
+    const r = (await win.webContents.executeJavaScript('(' + extractResultScript.toString() + ')()', true)) as {
+      vids?: Array<{ src: string; poster?: string }>
+      mp4s?: string[]
+    }
+    const vids = (r.vids ?? []).filter((v) => /^https?:/.test(v.src))
+    const mp4s = (r.mp4s ?? []).filter((m) => /\.mp4([?#]|$)/i.test(m))
+    // 取 DOM 顺序最后一条（豆包聊天页最新消息在底部）
+    const url = vids[vids.length - 1]?.src || mp4s[mp4s.length - 1]
+    if (!url) return { ok: false, error: '页面里没找到视频，请确认视频已生成' }
+    return { ok: true, videoUrl: url }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+/** 从已打开的豆包窗口提取所有视频 URL（供「选视频」兜底用：用户挑任意一条下载，非只取最后一条）。 */
+export async function extractAllDoubaoVideos(keyId?: string): Promise<{ ok: boolean; videos?: Array<{ src: string; poster?: string }>; error?: string }> {
+  const winKey = keyId ?? PARTITION
+  const win = openDoubaoWindows.get(winKey)
+  if (!win || win.isDestroyed()) return { ok: false, error: '豆包窗口未打开，请先点「打开豆包」' }
+  try {
+    const r = (await win.webContents.executeJavaScript('(' + extractResultScript.toString() + ')()', true)) as {
+      vids?: Array<{ src: string; poster?: string }>
+      mp4s?: string[]
+    }
+    const vids = (r.vids ?? []).filter((v) => /^https?:/.test(v.src))
+    const mp4s = (r.mp4s ?? []).filter((m) => /\.mp4([?#]|$)/i.test(m))
+    // vids 优先（带 poster 缩略图）；mp4s 去重兜底（无 poster）
+    const videos = vids.map((v) => ({ src: v.src, poster: v.poster || '' }))
+    for (const m of mp4s) {
+      if (!videos.some((v) => v.src === m)) videos.push({ src: m, poster: '' })
+    }
+    if (videos.length === 0) return { ok: false, error: '页面里没找到视频，请确认视频已生成' }
+    return { ok: true, videos }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+/** 自动拉取：生成失败后重开豆包页（隐藏）轮询提取最新视频，带次数限制。 */
+export async function autoRetryExtractDoubaoVideo(
+  keyId: string | undefined,
+  maxAttempts = 3,
+  intervalMs = 20000
+): Promise<{ ok: boolean; videoUrl?: string; error?: string }> {
+  const partition = keyId ? `persist:qf-p:doubao:${keyId}` : PARTITION
+  const win = new BrowserWindow({
+    show: false,
+    width: 1280,
+    height: 900,
+    webPreferences: {
+      partition,
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
+    }
+  })
+  try {
+    win.webContents.setUserAgent(UA)
+    await win.loadURL(DOUBAO_URL)
+    await sleep(8000)
+    for (let i = 0; i < maxAttempts; i++) {
+      const r = (await win.webContents.executeJavaScript('(' + extractResultScript.toString() + ')()', true)) as {
+        vids?: Array<{ src: string }>
+        mp4s?: string[]
+      }
+      const vids = (r.vids ?? []).filter((v) => /^https?:/.test(v.src))
+      const mp4s = (r.mp4s ?? []).filter((m) => /\.mp4([?#]|$)/i.test(m))
+      const url = vids[vids.length - 1]?.src || mp4s[mp4s.length - 1]
+      if (url) return { ok: true, videoUrl: url }
+      if (i < maxAttempts - 1) await sleep(intervalMs)
+    }
+    return { ok: false, error: '自动拉取未找到视频' }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
+  } finally {
+    try { win.destroy() } catch {}
   }
 }

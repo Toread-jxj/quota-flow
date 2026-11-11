@@ -221,6 +221,10 @@ export interface GenerateRequest {
   template?: string
   /** 测试开关：显示豆包 WebView 窗口（默认隐藏） */
   showWebview?: boolean
+  /** 手工指定账号：指定用某个厂商账号生成（keyId），为空/null 则自动选号 */
+  preferredAccountId?: string | null
+  /** 批量模式自动确认：豆包要求确认参数时自动回「确认」而不弹窗 */
+  autoConfirm?: boolean
 }
 
 export interface StoryboardDialogue {
@@ -246,7 +250,9 @@ export interface StoryboardParseResult {
   provider: string
   textPath: string
   batchDir: string
+  shotsDir: string
   shots: StoryboardShot[]
+  progress?: Record<number, { jobId?: string; remoteUrl?: string; videoPath?: string; status?: string; accountId?: string | null }>
 }
 
 export interface DesktopApi {
@@ -461,7 +467,8 @@ export interface DesktopApi {
     getUrl: (name: string) => Promise<string>
     getImageUrl: (name: string) => Promise<string>
     getRefVideoUrl: (name: string) => Promise<string>
-    showInFolder: (filePath: string) => Promise<{ ok: boolean; error?: string }>
+    showInFolder: (filePath: string, root?: string) => Promise<{ ok: boolean; error?: string }>
+    reDownloadJob: (params: { jobId: string; remoteUrl: string; userId: string; supabaseUrl: string; supabaseAnonKey: string; accessToken: string; refreshToken: string }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
   }
   watermark: {
     process: (input: WatermarkProcessInput) => Promise<WatermarkProcessResult>
@@ -507,8 +514,14 @@ export interface DesktopApi {
   storyboard: {
     pickDir: () => Promise<{ canceled: boolean; dir?: string }>
     parse: (params: { textPath?: string; workDir: string }) => Promise<{ ok: boolean; result?: StoryboardParseResult; error?: string }>
-    generate: (params: { gen: GenerateRequest; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
+    generate: (params: { gen: GenerateRequest; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; jobId?: string; remoteUrl?: string | null; accountId?: string | null; error?: string }>
     merge: (params: { batchDir: string }) => Promise<{ ok: boolean; output?: string; error?: string }>
+    reDownload: (params: { remoteUrl: string; jobId: string; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
+    openDoubaoPage: (params: { keyId?: string }) => Promise<{ ok: boolean; error?: string }>
+    downloadLatest: (params: { keyId?: string; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
+    listVideos: (params: { keyId?: string }) => Promise<{ ok: boolean; videos?: Array<{ src: string; poster?: string }>; error?: string }>
+    autoRetry: (params: { keyId?: string; batchDir: string; index: number; maxAttempts?: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
+    manualDownload: (params: { url: string; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
   }
 }
 
@@ -690,8 +703,10 @@ const api: DesktopApi = {
     getUrl: (name) => ipcRenderer.invoke('media:get-url', name) as Promise<string>,
     getImageUrl: (name) => ipcRenderer.invoke('media:get-image-url', name) as Promise<string>,
     getRefVideoUrl: (name) => ipcRenderer.invoke('media:get-ref-video-url', name) as Promise<string>,
-    showInFolder: (filePath) =>
-      ipcRenderer.invoke('media:show-in-folder', filePath) as Promise<{ ok: boolean; error?: string }>
+    showInFolder: (filePath, root) =>
+      ipcRenderer.invoke('media:show-in-folder', filePath, root) as Promise<{ ok: boolean; error?: string }>,
+    reDownloadJob: (params) =>
+      ipcRenderer.invoke('job:re-download', params) as Promise<{ ok: boolean; videoPath?: string; error?: string }>
   },
   watermark: {
     process: (input) => ipcRenderer.invoke('watermark:process', input) as Promise<WatermarkProcessResult>,
@@ -741,7 +756,13 @@ const api: DesktopApi = {
     pickDir: () => ipcRenderer.invoke('storyboard:pick-dir'),
     parse: (params) => ipcRenderer.invoke('storyboard:parse', params),
     generate: (params) => ipcRenderer.invoke('storyboard:generate', params),
-    merge: (params) => ipcRenderer.invoke('storyboard:merge', params)
+    merge: (params) => ipcRenderer.invoke('storyboard:merge', params),
+    reDownload: (params) => ipcRenderer.invoke('storyboard:re-download', params),
+    openDoubaoPage: (params) => ipcRenderer.invoke('doubao:open-page', params),
+    downloadLatest: (params) => ipcRenderer.invoke('doubao:download-latest', params),
+    listVideos: (params) => ipcRenderer.invoke('doubao:list-videos', params),
+    autoRetry: (params) => ipcRenderer.invoke('doubao:auto-retry', params),
+    manualDownload: (params) => ipcRenderer.invoke('storyboard:manual-download', params)
   },
 }
 

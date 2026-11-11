@@ -165,6 +165,7 @@ export default function History({
   const [promptPreview, setPromptPreview] = useState(false)
   const [mediaUrls, setMediaUrls] = useState<Record<string, string>>({})
   const [retryingId, setRetryingId] = useState<string | null>(null)
+  const [reDownloadingId, setReDownloadingId] = useState<string | null>(null)
   const [boxSelectItem, setBoxSelectItem] = useState<JobItem | null>(null)
   const [boxVideoUrl, setBoxVideoUrl] = useState<string | null>(null)
   const [boxBBoxes, setBoxBBoxes] = useState<WatermarkBBox[]>([])
@@ -367,6 +368,41 @@ export default function History({
       setNotice(e instanceof Error ? e.message : String(e))
     } finally {
       setRetryingId(null)
+    }
+  }
+
+  const reDownloadJob = async (item: JobItem): Promise<void> => {
+    if (reDownloadingId) return
+    const remoteUrl = item.record.resultUrl
+    if (!remoteUrl) return
+    try {
+      const auth = getAuthService()
+      const cfg = getSupabaseConfig()
+      const session = await auth?.getSession()
+      if (!auth || !cfg || !session || !user) {
+        setNotice('登录状态异常，无法补下载')
+        return
+      }
+      setReDownloadingId(item.id)
+      const res = await window.api.media.reDownloadJob({
+        supabaseUrl: cfg.url,
+        supabaseAnonKey: cfg.anonKey,
+        accessToken: session.access_token,
+        refreshToken: session.refresh_token,
+        userId: user.id,
+        jobId: item.id,
+        remoteUrl
+      })
+      if (!res.ok) {
+        setNotice(res.error ?? '补下载失败')
+      } else {
+        setNotice('补下载成功')
+      }
+      reload()
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : String(e))
+    } finally {
+      setReDownloadingId(null)
     }
   }
 
@@ -786,6 +822,17 @@ export default function History({
                               onClick={() => void openFolder(localPath)}
                             >
                               <IconFolder size={12} />
+                            </button>
+                          )}
+                          {r.status === '成功' && !localPath && r.resultUrl && (
+                            <button
+                              className="action-btn"
+                              title="补下载"
+                              aria-label="补下载"
+                              disabled={reDownloadingId === item.id}
+                              onClick={() => void reDownloadJob(item)}
+                            >
+                              补下载
                             </button>
                           )}
                           <button

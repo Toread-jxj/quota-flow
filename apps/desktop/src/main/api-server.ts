@@ -13,7 +13,7 @@
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { app } from 'electron'
-import { existsSync, writeFileSync } from 'node:fs'
+import { existsSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { runGenerate } from './dispatch'
 import type { GenerateInput } from './dispatch'
@@ -156,10 +156,22 @@ export function initApiServer(): void {
         }
         const localPath = videoLocalPath(result.jobId)
         const hasLocal = existsSync(localPath)
+        let outPath = localPath
+        // 可选 outputDir：调用方（如分镜编排 skill）指定输出目录，视频直接拷贝过去，省去二次拷贝
+        if (hasLocal && typeof body.outputDir === 'string' && body.outputDir) {
+          try {
+            mkdirSync(body.outputDir, { recursive: true })
+            const target = join(body.outputDir, `${result.jobId}.mp4`)
+            copyFileSync(localPath, target)
+            outPath = target
+          } catch (e) {
+            return json(res, 200, { ok: false, error: '拷贝到输出目录失败: ' + (e instanceof Error ? e.message : String(e)) })
+          }
+        }
         return json(res, 200, {
           ok: true,
           jobId: result.jobId,
-          videoPath: hasLocal ? localPath : null,
+          videoPath: hasLocal ? outPath : null,
           note: hasLocal ? undefined : '本地视频未落盘（可能下载失败，远端 URL 见 jobs 表）'
         })
       }

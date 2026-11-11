@@ -258,6 +258,7 @@ export default function Dashboard({
   const { recent: jobItems, reload: reloadJobs } = jobs
   const [provider, setProvider] = useState('doubao')
   const [model, setModel] = useState(MODELS.doubao[0])
+  const [preferredAccountId, setPreferredAccountId] = useState('')
   const [mode, setMode] = useState('text2video')
   const [duration, setDuration] = useState(5)
   const [resolution, setResolution] = useState('720')
@@ -795,6 +796,8 @@ export default function Dashboard({
   const visibleAggs = useMemo(() => provAggs.filter((p) => p.enabled !== false), [provAggs])
 
   // 厂商选项只取「已启用且已绑定」的厂商
+  const doubaoBindings = useMemo(() => provAggs.find((a) => a.providerId === 'doubao')?.bindings.filter((b) => b.enabled) ?? [], [provAggs])
+
   const providerOptions = useMemo(() => {
     if (activeBoundAggs.length === 0) return []
     return activeBoundAggs
@@ -1088,7 +1091,8 @@ export default function Dashboard({
         videoUrls: r2vVideoActive
           ? refVideoUrls.filter((u): u is string => typeof u === 'string' && /^https?:\/\//i.test(u))
           : undefined,
-        showWebview: getInitialShowWebview()
+        showWebview: getInitialShowWebview(),
+        preferredAccountId: preferredAccountId || null
       })
       activeJobIdRef.current = res.jobId ?? null
       if (!res.ok) {
@@ -1107,7 +1111,7 @@ export default function Dashboard({
       cancellingRef.current = false
       submittedRef.current = false
     }
-  }, [generating, fresh, step, prompt, mode, provider, model, features, caps, providerCaps, duration, durations, resolution, audio, ratio, imageFiles, savedImagePaths, apiImageUrls, uploadingCount, audioUploading, audioUrl, audioLocalPath, t2vSupportsAudio, r2vVideoActive, refVideoLocalPaths, refVideoUrls, refVideoUploading, isTkhFx, tkhFxTemplate, user, team, usageScope, onGenerate, reloadJobs, onGoProviders, providerOptions])
+  }, [generating, fresh, step, prompt, mode, provider, model, features, caps, providerCaps, duration, durations, resolution, audio, ratio, imageFiles, savedImagePaths, apiImageUrls, uploadingCount, audioUploading, audioUrl, audioLocalPath, t2vSupportsAudio, r2vVideoActive, refVideoLocalPaths, refVideoUrls, refVideoUploading, isTkhFx, tkhFxTemplate, user, team, usageScope, onGenerate, reloadJobs, onGoProviders, providerOptions, preferredAccountId])
 
   /** 终止生成：发送前有效；点击后按钮锁定「正在终止…」直到任务真正结束，防止连点 */
   const handleCancel = useCallback(async (): Promise<void> => {
@@ -1471,6 +1475,24 @@ export default function Dashboard({
                 options={providerOptions.length > 0 ? providerOptions : [{ value: '', label: '未绑定厂商' }]}
               />
             </div>
+            {provider === 'doubao' && (
+              <div className="param-field">
+                <label htmlFor="account">选择账号</label>
+                <Select
+                  id="account"
+                  value={preferredAccountId}
+                  onChange={setPreferredAccountId}
+                  options={[
+                    { value: '', label: '自动' },
+                    ...doubaoBindings.map((k) => ({
+                      value: k.keyId,
+                      label: `${k.accountName}（剩 ${k.remaining}秒）${k.health === 'expired' ? '｜已失效' : ''}`,
+                      disabled: k.health === 'expired'
+                    }))
+                  ]}
+                />
+              </div>
+            )}
             <div className="param-field">
               <label htmlFor="model">选择模型</label>
               <Select

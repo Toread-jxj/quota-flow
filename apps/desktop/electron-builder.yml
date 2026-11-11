@@ -19,6 +19,9 @@ files:
   - "!node_modules/@supabase/**/*.map"
   - "!node_modules/@supabase/**/src/**"
   - "!node_modules/@supabase/**/*.tsbuildinfo"
+  # ffmpeg-static 的二进制已通过 extraResources 复制到 resources/ffmpeg/，
+  # 这里排除包内二进制避免 asar 再打一份（省 ~80MB）；保留 index.js 供开发模式 require
+  - "!node_modules/ffmpeg-static/ffmpeg*"
 asar: true
 electronLanguages:
   - zh-CN

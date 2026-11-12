@@ -45,9 +45,12 @@ jobs:
       # 打包前必须写入 .env，否则产物运行时 isAuthConfigured() 为 false 导致“未配置 Supabase”）
       - name: Inject Supabase env
         shell: bash
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL || 'https://video.toreadtousto.dpdns.org' }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY || 'sb_publishable_ACJWlzQHlZjBrEguHvfOxg_3BJgxAaH' }}
         run: |
-          echo "VITE_SUPABASE_URL=${{ secrets.SUPABASE_URL }}" >> apps/desktop/.env
-          echo "VITE_SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}" >> apps/desktop/.env
+          echo "VITE_SUPABASE_URL=$SUPABASE_URL" > apps/desktop/.env
+          echo "VITE_SUPABASE_ANON_KEY=$SUPABASE_ANON_KEY" >> apps/desktop/.env
       # electron-builder 用 package.json 的 version 生成安装包名，必须与 tag 对齐，
       # 否则 Release 标题 (v0.2.x) 与实际包名 (0.2.5) 脱节
       - name: Align desktop version with tag

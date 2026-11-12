@@ -711,10 +711,12 @@ app.whenReady().then(() => {
     return { canceled: false, dir: r.filePaths[0] }
   })
 
-  // ---- 分镜编排进度文件（.storyboard-progress.json，记录每段 shot 的 jobId/remoteUrl/视频路径）----
+  // ---- 分镜编排进度文件（storyboard-progress.json，记录每段 shot 的 jobId/remoteUrl/视频路径）----
   const readStoryboardProgress = (workDir: string): Record<string, { jobId?: string; remoteUrl?: string; videoPath?: string; status?: string; accountId?: string | null }> => {
     try {
-      const p = join(workDir, '.storyboard-progress.json')
+      const normalPath = join(workDir, 'storyboard-progress.json')
+      const legacyPath = join(workDir, '.storyboard-progress.json')
+      const p = existsSync(normalPath) ? normalPath : legacyPath
       if (!existsSync(p)) return {}
       const raw = JSON.parse(readFileSync(p, 'utf8'))
       return (raw && raw.shots) || {}
@@ -724,11 +726,13 @@ app.whenReady().then(() => {
   }
   const writeStoryboardProgress = (workDir: string, index: number, entry: { jobId?: string | null; remoteUrl?: string | null; videoPath?: string; status?: string; accountId?: string | null }): { ok: boolean; error?: string } => {
     try {
-      const p = join(workDir, '.storyboard-progress.json')
+      const p = join(workDir, 'storyboard-progress.json')
+      const legacyPath = join(workDir, '.storyboard-progress.json')
       let raw: { shots?: Record<string, unknown> } = {}
-      if (existsSync(p)) {
+      const sourcePath = existsSync(p) ? p : legacyPath
+      if (existsSync(sourcePath)) {
         try {
-          const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'))
+          const parsed: unknown = JSON.parse(readFileSync(sourcePath, 'utf8'))
           const validity = validateStoryboardProgressRoot(parsed)
           if (!validity.ok) return { ok: false, error: validity.error || '进度文件结构无效' }
           raw = parsed as { shots?: Record<string, unknown> }

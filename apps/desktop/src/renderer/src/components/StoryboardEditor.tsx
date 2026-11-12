@@ -136,8 +136,8 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
       })
       setStatusMap((m) => ({ ...m, [shot.index]: 'running' as ShotStatus }))
       try {
-        // 进度文件只是恢复辅助，写入失败不能阻断实际生成。
-        await window.api.storyboard.beginGenerate({ batchDir: result.batchDir, index: shot.index }).catch(() => {})
+        const begun = await window.api.storyboard.beginGenerate({ batchDir: result.batchDir, index: shot.index })
+        if (!begun.ok) throw new Error(begun.error || '无法清理上一轮分镜进度')
         const gen = await buildGen(user, shot, preferredAccountId || null, { autoConfirm: isBatch })
         if (!gen) {
           const failed = await window.api.storyboard.markError({ batchDir: result.batchDir, index: shot.index })

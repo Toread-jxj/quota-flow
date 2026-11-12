@@ -26,6 +26,7 @@ import {
 } from './query-cache'
 import { withElectronNet } from './supabase-network'
 import { findNextProviderAccount } from './account-selection'
+import { decideAccountRetry } from './account-retry-policy'
 import { logGeneration } from './diagnostics'
 
 export interface GenerateInput {
@@ -534,9 +535,39 @@ export async function runGenerate(
         }
         if (!c || c.length === 0) {
           lastError = `账号「${cand.account_name || '未命名'}」cookie 解密失败`
+          if (resolvedProviderId === 'doubao') {
+            // 豆包失败恢复必须保留账号 ID，确保人工兜底使用原账号 partition。
+            selectedKey = { id: cand.id, accountName: cand.account_name }
+            const retry = !input.preferredAccountId
+            try {
+              await providerSvc.updateHealth(input.userId, cand.id, 'expired')
+              invalidateKeysByKeyId(cand.id)
+            } catch (e) {
+              logGeneration('account-health-update-failed', { jobId: job.id, accountId: cand.id, error: e })
+            }
+            logGeneration('account-retry-decision', {
+              jobId: job.id,
+              accountId: cand.id,
+              error: lastError,
+              retry,
+              expireAccount: true,
+              reason: input.preferredAccountId ? 'preferred-account-locked' : 'account-auth-failure'
+            })
+            if (!retry) break
+          }
+          // 非豆包厂商保持本轮修改前的既有行为：凭据解密失败时继续候选账号，不附加健康态变更。
           continue
         }
         selectedKey = { id: cand.id, accountName: cand.account_name }
+        logGeneration('account-attempt-start', {
+          jobId: job.id,
+          round: round + 1,
+          accountId: cand.id,
+          accountName: cand.account_name ?? null,
+          partition: `persist:qf-p:${resolvedProviderId}:${cand.id}`,
+          mode: input.mode,
+          imageCount: images.length
+        })
         emit({
           jobId: job.id,
           status: 'running',
@@ -551,6 +582,14 @@ export async function runGenerate(
         })
         // 任务注册后、进入引擎前已被取消 → 直接返回中断结果
         if (runCancelState.aborted) {
+          logGeneration('account-retry-decision', {
+            jobId: job.id,
+            accountId: cand.id,
+            error: '进入引擎前已手动终止',
+            retry: false,
+            expireAccount: false,
+            reason: 'cancelled-before-engine'
+          })
           result = {
             ok: false,
             providerId: resolvedProviderId as 'doubao' | 'qwenwan' | 'yuanbao' | 'dola',
@@ -624,14 +663,39 @@ export async function runGenerate(
             cancel: runCancelState,
             showWebview: input.showWebview,
             autoConfirm: input.autoConfirm,
-            onProgress: (stage, detail) =>
+            onProgress: (stage, detail) => {
+              const diagnosticDetail = detail && typeof detail === 'object'
+                ? { ...(detail as Record<string, unknown>), prompt: undefined, submitPrompt: undefined }
+                : detail
+              logGeneration('webview-stage', { jobId: job.id, accountId: cand.id, providerId: resolvedProviderId, stage, detail: diagnosticDetail })
               emit({ jobId: job.id, status: 'running', stage, message: stage, data: detail })
+            }
           })
         }
-        if (result.ok && result.videoUrl) break
+        logGeneration('account-attempt-result', {
+          jobId: job.id,
+          accountId: cand.id,
+          ok: result.ok,
+          hasVideoUrl: !!result.videoUrl,
+          cancelled: !!result.cancelled,
+          blocked: !!result.blocked,
+          errorCode: result.cancelled ? 'USER_CANCELLED' : result.blocked ? 'CONTENT_BLOCKED' : result.ok ? null : 'GENERATION_FAILED'
+        })
+        if (result.ok && result.videoUrl) {
+          logGeneration('account-attempt-stop', { jobId: job.id, accountId: cand.id, reason: 'video-url-received' })
+          break
+        }
         lastError = result.error || '生成失败'
         // 用户手动终止（提示词未发送）：标记为失败，不再换号
         if (result.cancelled) {
+          logGeneration('account-retry-decision', {
+            jobId: job.id,
+            accountId: cand.id,
+            error: '已手动终止生成（提示词未发送）',
+            retry: false,
+            expireAccount: false,
+            reason: 'cancelled'
+          })
           try {
             await jobSvc.updateJob(input.userId, job.id, {
               status: 'failed',
@@ -645,10 +709,18 @@ export async function runGenerate(
             status: 'failed',
             message: '已手动终止生成（提示词未发送）'
           })
-          return { ok: false, jobId: job.id, error: '已手动终止生成（提示词未发送）' }
+          return { ok: false, jobId: job.id, error: '已手动终止生成（提示词未发送）', accountId: selectedKey?.id ?? cand.id }
         }
         // 内容政策拒绝（侵权/肖像/版权）：与账号无关，不再切换账号重试
         if (result.blocked) {
+          logGeneration('account-retry-decision', {
+            jobId: job.id,
+            accountId: cand.id,
+            error: lastError,
+            retry: false,
+            expireAccount: false,
+            reason: 'content-blocked'
+          })
           emit({
             jobId: job.id,
             status: 'running',
@@ -657,20 +729,51 @@ export async function runGenerate(
           })
           break
         }
-        if (input.preferredAccountId || /未登录|登录|API Key/.test(lastError)) {
-          try {
-            await providerSvc.updateHealth(input.userId, cand.id, 'expired')
-            // 健康态变了会直接影响后续生成的选号排序，立即失效该 key 所在分区缓存
-            invalidateKeysByKeyId(cand.id)
-          } catch {}
+        if (resolvedProviderId === 'doubao') {
+          const retryDecision = decideAccountRetry(lastError, !!input.preferredAccountId, resolvedProviderId)
+          logGeneration('account-retry-decision', {
+            jobId: job.id,
+            accountId: cand.id,
+            error: lastError,
+            retry: retryDecision.retry,
+            expireAccount: retryDecision.expireAccount,
+            reason: retryDecision.reason
+          })
+          if (retryDecision.expireAccount) {
+            try {
+              await providerSvc.updateHealth(input.userId, cand.id, 'expired')
+              // 健康态变了会直接影响后续生成的选号排序，立即失效该 key 所在分区缓存
+              invalidateKeysByKeyId(cand.id)
+            } catch (e) {
+              logGeneration('account-health-update-failed', { jobId: job.id, accountId: cand.id, error: e })
+            }
+          }
+          emit({
+            jobId: job.id,
+            status: 'running',
+            stage: retryDecision.retry ? 'account-failed' : 'account-stopped',
+            message: retryDecision.retry
+              ? `账号「${cand.account_name || '未命名'}」失败，准备换号：${lastError}`
+              : `账号「${cand.account_name || '未命名'}」失败，已停止且不换号：${lastError}`,
+            data: { accountId: cand.id, retry: retryDecision.retry, reason: retryDecision.reason }
+          })
+          if (!retryDecision.retry) break
+        } else {
+          // 非豆包厂商保持本轮修改前的原有行为：失败后尝试下一账号；明确登录/API Key 错误标记失效。
+          if (input.preferredAccountId || /未登录|登录|API Key/.test(lastError)) {
+            try {
+              await providerSvc.updateHealth(input.userId, cand.id, 'expired')
+              invalidateKeysByKeyId(cand.id)
+            } catch {}
+          }
+          emit({
+            jobId: job.id,
+            status: 'running',
+            stage: 'account-failed',
+            message: `账号「${cand.account_name || '未命名'}」失败：${lastError}`,
+            data: { accountId: cand.id }
+          })
         }
-        emit({
-          jobId: job.id,
-          status: 'running',
-          stage: 'account-failed',
-          message: `账号「${cand.account_name || '未命名'}」失败：${lastError}`,
-          data: { accountId: cand.id }
-        })
       }
     } catch (e) {
       lastError = '选号/执行异常: ' + (errMsg(e))
@@ -687,9 +790,10 @@ export async function runGenerate(
         options: jobOptions,
         completedAt: new Date().toISOString()
       })
-    } catch {
-      // 状态回写失败不阻断错误返回
+    } catch (e) {
+      logGeneration('job-status-update-failed', { jobId: job.id, targetStatus: 'failed', error: e })
     }
+    logGeneration('run-result', { jobId: job.id, ok: false, accountId: selectedKey?.id ?? null, errorCode: result?.blocked ? 'CONTENT_BLOCKED' : result?.cancelled ? 'USER_CANCELLED' : 'GENERATION_FAILED' })
     emit({ jobId: job.id, status: 'failed', message: err })
     return { ok: false, jobId: job.id, error: err, accountId: selectedKey?.id ?? null }
   }
@@ -709,6 +813,7 @@ export async function runGenerate(
       message: '视频下载异常，继续使用远程 URL: ' + (errMsg(e))
     })
   }
+  logGeneration('download-result', { jobId: job.id, ok: !!localPath, error: downloadError || null })
   const resultUrl = localPath || result.videoUrl
   // Dola（Dreamina）导出多为 HEVC，Chromium 无 HEVC 解码器 → 检测为 HEVC 时转码为 H.264，保证应用内可播
   if (localPath) await ensurePlayableVideo(resolvedProviderId, localPath)
@@ -747,9 +852,41 @@ export async function runGenerate(
     if (consumed) onQuotaUpdated?.({ userId: input.userId, ledger: consumed })
   } catch (e) {
     const quotaErr = '额度扣减失败: ' + errMsg(e)
+    try {
+      await jobSvc.updateJob(input.userId, job.id, {
+        status: 'failed',
+        error: quotaErr,
+        resultUrl,
+        costUnit,
+        costAmount: cost,
+        attempts: result.attempts,
+        options: {
+          ...jobOptions,
+          remoteUrl: result.videoUrl,
+          localPath: localPath || null,
+          cleanLocalPath: null,
+          originalLocalPath: localPath || null,
+          watermarkStatus: 'none',
+          watermarkMethod: null,
+          watermarkError: null,
+          posterUrl: result.posterUrl ?? null,
+          accountId: selectedKey?.id ?? null,
+          accountName: selectedKey?.accountName ?? null
+        },
+        completedAt: new Date().toISOString()
+      })
+    } catch (updateError) {
+      logGeneration('job-status-update-failed', { jobId: job.id, targetStatus: 'failed', error: updateError })
+    }
+    emit({ jobId: job.id, status: 'failed', message: quotaErr })
+    return { ok: false, jobId: job.id, error: quotaErr, remoteUrl: result.videoUrl ?? null, accountId: selectedKey?.id ?? null }
+  }
+
+  try {
     await jobSvc.updateJob(input.userId, job.id, {
-      status: 'failed',
-      error: quotaErr,
+      status: 'success',
+      providerId: resolvedProviderId,
+      accountId: selectedKey?.id ?? null,
       resultUrl,
       costUnit,
       costAmount: cost,
@@ -758,6 +895,7 @@ export async function runGenerate(
         ...jobOptions,
         remoteUrl: result.videoUrl,
         localPath: localPath || null,
+        downloadError: downloadError || null,
         cleanLocalPath: null,
         originalLocalPath: localPath || null,
         watermarkStatus: 'none',
@@ -769,34 +907,12 @@ export async function runGenerate(
       },
       completedAt: new Date().toISOString()
     })
-    emit({ jobId: job.id, status: 'failed', message: quotaErr })
-    return { ok: false, jobId: job.id, error: quotaErr, accountId: selectedKey?.id ?? null }
+  } catch (updateError) {
+    const updateErr = '生成成功但任务状态回写失败: ' + errMsg(updateError)
+    logGeneration('job-status-update-failed', { jobId: job.id, targetStatus: 'success', error: updateError })
+    emit({ jobId: job.id, status: 'failed', message: updateErr })
+    return { ok: false, jobId: job.id, error: updateErr, remoteUrl: result.videoUrl ?? null, accountId: selectedKey?.id ?? null }
   }
-
-  await jobSvc.updateJob(input.userId, job.id, {
-    status: 'success',
-    providerId: resolvedProviderId,
-    accountId: selectedKey?.id ?? null,
-    resultUrl,
-    costUnit,
-    costAmount: cost,
-    attempts: result.attempts,
-    options: {
-      ...jobOptions,
-      remoteUrl: result.videoUrl,
-      localPath: localPath || null,
-      downloadError: downloadError || null,
-      cleanLocalPath: null,
-      originalLocalPath: localPath || null,
-      watermarkStatus: 'none',
-      watermarkMethod: null,
-      watermarkError: null,
-      posterUrl: result.posterUrl ?? null,
-      accountId: selectedKey?.id ?? null,
-      accountName: selectedKey?.accountName ?? null
-    },
-    completedAt: new Date().toISOString()
-  })
   emit({
     jobId: job.id,
     status: 'success',

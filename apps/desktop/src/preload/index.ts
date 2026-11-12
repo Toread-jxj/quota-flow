@@ -516,13 +516,14 @@ export interface DesktopApi {
   storyboard: {
     pickDir: () => Promise<{ canceled: boolean; dir?: string }>
     parse: (params: { textPath?: string; workDir: string }) => Promise<{ ok: boolean; result?: StoryboardParseResult; error?: string }>
+    beginGenerate: (params: { batchDir: string; index: number }) => Promise<{ ok: boolean; error?: string }>
+    markError: (params: { batchDir: string; index: number }) => Promise<{ ok: boolean; error?: string }>
     generate: (params: { gen: GenerateRequest; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; jobId?: string; remoteUrl?: string | null; accountId?: string | null; error?: string }>
     merge: (params: { batchDir: string }) => Promise<{ ok: boolean; output?: string; error?: string }>
     reDownload: (params: { remoteUrl: string; jobId: string; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
     openDoubaoPage: (params: { keyId?: string }) => Promise<{ ok: boolean; error?: string }>
     downloadLatest: (params: { keyId?: string; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
     listVideos: (params: { keyId?: string }) => Promise<{ ok: boolean; videos?: Array<{ src: string; poster?: string }>; error?: string }>
-    autoRetry: (params: { keyId?: string; batchDir: string; index: number; maxAttempts?: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
     manualDownload: (params: { url: string; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
     diagnosticsPath: () => Promise<{ ok: boolean; path?: string }>
   }
@@ -758,13 +759,14 @@ const api: DesktopApi = {
   storyboard: {
     pickDir: () => ipcRenderer.invoke('storyboard:pick-dir'),
     parse: (params) => ipcRenderer.invoke('storyboard:parse', params),
+    beginGenerate: (params) => ipcRenderer.invoke('storyboard:begin-generate', params),
+    markError: (params) => ipcRenderer.invoke('storyboard:mark-error', params),
     generate: (params) => ipcRenderer.invoke('storyboard:generate', params),
     merge: (params) => ipcRenderer.invoke('storyboard:merge', params),
     reDownload: (params) => ipcRenderer.invoke('storyboard:re-download', params),
     openDoubaoPage: (params) => ipcRenderer.invoke('doubao:open-page', params),
     downloadLatest: (params) => ipcRenderer.invoke('doubao:download-latest', params),
     listVideos: (params) => ipcRenderer.invoke('doubao:list-videos', params),
-    autoRetry: (params) => ipcRenderer.invoke('doubao:auto-retry', params),
     manualDownload: (params) => ipcRenderer.invoke('storyboard:manual-download', params),
     diagnosticsPath: () => ipcRenderer.invoke('storyboard:diagnostics-path')
   },

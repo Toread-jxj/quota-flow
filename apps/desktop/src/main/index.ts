@@ -17,7 +17,7 @@ import { runGenerate, downloadVideo } from './dispatch'
 import type { DispatchEvent, QuotaUpdatedPayload } from './dispatch'
 import { initApiServer, setApiContext } from './api-server'
 import { parseStoryboardText, matchAssets, mergeVideos, shotFileName, findStoryboardFiles } from './storyboard'
-import { openDoubaoPage, extractLatestDoubaoVideoUrl, autoRetryExtractDoubaoVideo, extractAllDoubaoVideos } from './webview-engine'
+import { openDoubaoPage, extractLatestDoubaoVideoUrl, extractAllDoubaoVideos } from './webview-engine'
 import type { ApiContext } from './api-server'
 import type { UpdaterStatus } from './updater'
 import { getWatermarkStatus, processWatermarkJob } from './watermark-remover/job'
@@ -27,6 +27,7 @@ import { getMaterialStore } from './materials/store'
 import { uploadImage as uploadImageToGh, cleanupOldImages } from './github-upload'
 import { clearKeysCache, handleKeysCacheInvalidate } from './query-cache'
 import { generationLogPath, logGeneration } from './diagnostics'
+import { validateStoryboardProgressRoot } from './storyboard-progress-policy'
 
 /** 活跃生成任务注册表：jobId → 取消/已提交状态（用于「终止生成」与「关闭确认」） */
 interface ActiveRunState {
@@ -721,18 +722,47 @@ app.whenReady().then(() => {
       return {}
     }
   }
-  const writeStoryboardProgress = (workDir: string, index: number, entry: { jobId?: string | null; remoteUrl?: string | null; videoPath?: string; status?: string; accountId?: string | null }): void => {
+  const writeStoryboardProgress = (workDir: string, index: number, entry: { jobId?: string | null; remoteUrl?: string | null; videoPath?: string; status?: string; accountId?: string | null }): { ok: boolean; error?: string } => {
     try {
       const p = join(workDir, '.storyboard-progress.json')
       let raw: { shots?: Record<string, unknown> } = {}
       if (existsSync(p)) {
-        try { raw = JSON.parse(readFileSync(p, 'utf8')) } catch { raw = {} }
+        try {
+          const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'))
+          const validity = validateStoryboardProgressRoot(parsed)
+          if (!validity.ok) return { ok: false, error: validity.error || '进度文件结构无效' }
+          raw = parsed as { shots?: Record<string, unknown> }
+        } catch (e) {
+          return { ok: false, error: `进度文件无法解析，已拒绝覆盖: ${e instanceof Error ? e.message : String(e)}` }
+        }
       }
       raw.shots = raw.shots || {}
-      raw.shots[String(index)] = { ...(raw.shots[String(index)] as Record<string, unknown> || {}), ...entry }
+      const next = { ...(raw.shots[String(index)] as Record<string, unknown> || {}), ...entry }
+      if (entry.jobId === null) delete next.jobId
+      if (entry.remoteUrl === null) delete next.remoteUrl
+      if (entry.accountId === null) delete next.accountId
+      if (entry.videoPath === undefined) delete next.videoPath
+      raw.shots[String(index)] = next
       writeFileSync(p, JSON.stringify(raw, null, 2), 'utf8')
-    } catch {}
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
   }
+
+  ipcMain.handle('storyboard:begin-generate', async (_e, params: { batchDir: string; index: number }) => {
+    return writeStoryboardProgress(params.batchDir, params.index, {
+      jobId: null,
+      remoteUrl: null,
+      videoPath: undefined,
+      accountId: null,
+      status: 'pending'
+    })
+  })
+
+  ipcMain.handle('storyboard:mark-error', async (_e, params: { batchDir: string; index: number }) => {
+    return writeStoryboardProgress(params.batchDir, params.index, { status: 'error' })
+  })
 
   ipcMain.handle('storyboard:parse', async (_e, params: { textPath?: string; workDir: string }) => {
     try {
@@ -760,7 +790,10 @@ app.whenReady().then(() => {
         const idx = shot.index
         const saved = savedProgress[String(idx)] || {}
         const filePath = join(shotsDir, shotFileName(idx))
-        if (existsSync(filePath)) {
+        if (saved.status === 'pending') {
+          // 新一轮生成已开始：旧文件仍保留，但不得在重启后冒充本轮已完成。
+          progress[idx] = { ...saved, videoPath: undefined, status: 'pending' }
+        } else if (existsSync(filePath)) {
           progress[idx] = { ...saved, videoPath: filePath, status: 'done' }
         } else if (saved.remoteUrl) {
           // 文件已丢失但进度里还有 remoteUrl：清掉 videoPath（避免前端误判「文件还在」），
@@ -781,12 +814,15 @@ app.whenReady().then(() => {
     'storyboard:generate',
     async (_e, params: { gen: Parameters<typeof runGenerate>[0]; batchDir: string; index: number }) => {
       logGeneration('storyboard-generate-start', { index: params.index, durationSec: params.gen.durationSec, preferredAccountId: params.gen.preferredAccountId ?? null, mode: params.gen.mode })
+      let generationResult: Awaited<ReturnType<typeof runGenerate>> | null = null
       try {
-        const result = await runGenerate(params.gen, () => {}, undefined, undefined)
+        generationResult = await runGenerate(params.gen, () => {}, undefined, undefined)
+        const result = generationResult
         logGeneration('storyboard-generate-result', { index: params.index, ok: result.ok, jobId: result.jobId ?? null, error: result.error ?? null, accountId: result.accountId ?? null, hasRemoteUrl: !!result.remoteUrl })
         if (!result.ok || !result.jobId) {
-          writeStoryboardProgress(params.batchDir, params.index, { jobId: result.jobId || null, remoteUrl: null, accountId: result.accountId || null, status: 'error' })
-          return { ok: false, error: result.error || '生成失败', accountId: result.accountId ?? null }
+          const saved = writeStoryboardProgress(params.batchDir, params.index, { jobId: result.jobId || null, remoteUrl: result.remoteUrl || null, accountId: result.accountId || null, status: 'error' })
+          if (!saved.ok) return { ok: false, error: `生成失败且进度写入失败: ${saved.error || '未知错误'}`, jobId: result.jobId, remoteUrl: result.remoteUrl ?? null, accountId: result.accountId ?? null }
+          return { ok: false, error: result.error || '生成失败', jobId: result.jobId, remoteUrl: result.remoteUrl ?? null, accountId: result.accountId ?? null }
         }
         let src = join(app.getPath('userData'), 'videos', `${result.jobId}.mp4`)
         if (!existsSync(src) && result.remoteUrl) {
@@ -795,18 +831,25 @@ app.whenReady().then(() => {
           if (retried) src = retried
         }
         if (!existsSync(src)) {
-          writeStoryboardProgress(params.batchDir, params.index, { jobId: result.jobId, remoteUrl: result.remoteUrl || null, status: 'error' })
+          const saved = writeStoryboardProgress(params.batchDir, params.index, { jobId: result.jobId, remoteUrl: result.remoteUrl || null, accountId: result.accountId ?? null, status: 'error' })
+          if (!saved.ok) return { ok: false, error: `视频未落盘且进度写入失败: ${saved.error || '未知错误'}`, jobId: result.jobId, remoteUrl: result.remoteUrl || null, accountId: result.accountId ?? null }
           return { ok: false, error: '视频未落盘（可能下载失败）', jobId: result.jobId, remoteUrl: result.remoteUrl || null, accountId: result.accountId ?? null }
         }
         const shotsDir = join(params.batchDir, 'shots')
         mkdirSync(shotsDir, { recursive: true })
         const dst = join(shotsDir, shotFileName(params.index))
         copyFileSync(src, dst)
-        writeStoryboardProgress(params.batchDir, params.index, { jobId: result.jobId, remoteUrl: result.remoteUrl || null, videoPath: dst, status: 'done', accountId: result.accountId ?? null })
+        const saved = writeStoryboardProgress(params.batchDir, params.index, { jobId: result.jobId, remoteUrl: result.remoteUrl || null, videoPath: dst, status: 'done', accountId: result.accountId ?? null })
+        if (!saved.ok) return { ok: false, error: `视频已落盘但进度写入失败: ${saved.error || '未知错误'}`, jobId: result.jobId, remoteUrl: result.remoteUrl || null, accountId: result.accountId ?? null }
         return { ok: true, videoPath: dst, jobId: result.jobId }
       } catch (e) {
         logGeneration('storyboard-generate-exception', { index: params.index, error: e })
-        return { ok: false, error: e instanceof Error ? e.message : String(e) }
+        const accountId = generationResult?.accountId ?? params.gen.preferredAccountId ?? null
+        const jobId = generationResult?.jobId ?? null
+        const remoteUrl = generationResult?.remoteUrl ?? null
+        const saved = writeStoryboardProgress(params.batchDir, params.index, { jobId, remoteUrl, accountId, status: 'error' })
+        const error = e instanceof Error ? e.message : String(e)
+        return { ok: false, error: saved.ok ? error : `${error}；进度写入失败: ${saved.error || '未知错误'}`, jobId, remoteUrl, accountId }
       }
     }
   )
@@ -837,7 +880,8 @@ app.whenReady().then(() => {
       mkdirSync(shotsDir, { recursive: true })
       const dst = join(shotsDir, shotFileName(params.index))
       copyFileSync(downloaded, dst)
-      writeStoryboardProgress(params.batchDir, params.index, { jobId: params.jobId, remoteUrl: params.remoteUrl, videoPath: dst, status: 'done' })
+      const saved = writeStoryboardProgress(params.batchDir, params.index, { jobId: params.jobId, remoteUrl: params.remoteUrl, videoPath: dst, status: 'done' })
+      if (!saved.ok) return { ok: false, error: `视频已补下载但进度写入失败: ${saved.error || '未知错误'}` }
       return { ok: true, videoPath: dst }
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) }
@@ -858,7 +902,8 @@ app.whenReady().then(() => {
       mkdirSync(shotsDir, { recursive: true })
       const dst = join(shotsDir, shotFileName(params.index))
       copyFileSync(downloaded, dst)
-      writeStoryboardProgress(params.batchDir, params.index, { jobId, remoteUrl: url, videoPath: dst, status: 'done' })
+      const saved = writeStoryboardProgress(params.batchDir, params.index, { jobId, remoteUrl: url, videoPath: dst, status: 'done' })
+      if (!saved.ok) return { ok: false, error: `视频已下载但进度写入失败: ${saved.error || '未知错误'}` }
       return { ok: true, videoPath: dst }
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) }
@@ -910,7 +955,8 @@ app.whenReady().then(() => {
       mkdirSync(shotsDir, { recursive: true })
       const dst = join(shotsDir, shotFileName(params.index))
       copyFileSync(downloaded, dst)
-      writeStoryboardProgress(params.batchDir, params.index, { jobId, remoteUrl: r.videoUrl, videoPath: dst, status: 'done' })
+      const saved = writeStoryboardProgress(params.batchDir, params.index, { jobId, remoteUrl: r.videoUrl, videoPath: dst, status: 'done' })
+      if (!saved.ok) return { ok: false, error: `视频已下载但进度写入失败: ${saved.error || '未知错误'}` }
       return { ok: true, videoPath: dst }
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) }
@@ -926,25 +972,6 @@ app.whenReady().then(() => {
     }
   })
 
-  // 自动拉取：生成失败后，后台隐藏窗口重开豆包页轮询提取最新视频，带次数限制
-  ipcMain.handle('doubao:auto-retry', async (_e, params: { keyId?: string; batchDir: string; index: number; maxAttempts?: number }) => {
-    try {
-      const r = await autoRetryExtractDoubaoVideo(params.keyId, params.maxAttempts ?? 3, 20000)
-      if (!r.ok || !r.videoUrl) return { ok: false, error: r.error || '自动拉取失败' }
-      let dlError = ''
-      const jobId = `auto-${params.index}-${Date.now()}`
-      const downloaded = await downloadVideo(r.videoUrl, jobId, 'doubao', 0, (reason) => { dlError = reason })
-      if (!downloaded) return { ok: false, error: dlError || '下载失败' }
-      const shotsDir = join(params.batchDir, 'shots')
-      mkdirSync(shotsDir, { recursive: true })
-      const dst = join(shotsDir, shotFileName(params.index))
-      copyFileSync(downloaded, dst)
-      writeStoryboardProgress(params.batchDir, params.index, { jobId, remoteUrl: r.videoUrl, videoPath: dst, status: 'done' })
-      return { ok: true, videoPath: dst }
-    } catch (e) {
-      return { ok: false, error: e instanceof Error ? e.message : String(e) }
-    }
-  })
 
   createWindow()
 

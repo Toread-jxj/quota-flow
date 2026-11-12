@@ -14,6 +14,7 @@ interface StoryboardEditorProps {
 }
 
 type ShotStatus = 'pending' | 'running' | 'done' | 'error'
+const BATCH_GENERATION_ENABLED = false
 
 /** 组装 runGenerate 需要的输入（复用桌面端登录态 + Supabase 上下文） */
 async function buildGen(user: AuthUser, shot: StoryboardShot, preferredAccountId?: string | null, opts?: { autoConfirm?: boolean }): Promise<GenerateRequest | null> {
@@ -47,13 +48,13 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
   const [statusMap, setStatusMap] = useState<Record<number, ShotStatus>>({})
   const [videos, setVideos] = useState<Record<number, string>>({})
   const [generating, setGenerating] = useState(false)
+  const [activeShotIndex, setActiveShotIndex] = useState<number | null>(null)
   const [finalVideo, setFinalVideo] = useState<string | null>(null)
   const [merging, setMerging] = useState(false)
   const [confirmRegen, setConfirmRegen] = useState<number | null>(null)
   const [retryInfo, setRetryInfo] = useState<Record<number, { jobId: string; remoteUrl: string }>>({})
   const [openInfo, setOpenInfo] = useState<Record<number, string>>({})
   const [openedPage, setOpenedPage] = useState<number | null>(null)
-  const [retryMsg, setRetryMsg] = useState<Record<number, string>>({})
   const [preferredAccountId, setPreferredAccountId] = useState('')
   const [manualUrlFor, setManualUrlFor] = useState<number | null>(null)
   const [manualUrlValue, setManualUrlValue] = useState('')
@@ -114,12 +115,33 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
   const generateOne = useCallback(
     async (shot: StoryboardShot, opts?: { isBatch?: boolean }) => {
       const isBatch = opts?.isBatch === true
-      if (!result) return
+      if (!result || activeShotIndex !== null) return
+      setActiveShotIndex(shot.index)
+      // 新一轮生成开始前清除该分镜上一次失败留下的账号/补下载信息，避免本次未知失败误用旧现场。
+      setOpenInfo((m) => {
+        const next = { ...m }
+        delete next[shot.index]
+        return next
+      })
+      setRetryInfo((m) => {
+        const next = { ...m }
+        delete next[shot.index]
+        return next
+      })
+      setOpenedPage((current) => current === shot.index ? null : current)
+      setVideos((m) => {
+        const next = { ...m }
+        delete next[shot.index]
+        return next
+      })
       setStatusMap((m) => ({ ...m, [shot.index]: 'running' as ShotStatus }))
       try {
+        const begun = await window.api.storyboard.beginGenerate({ batchDir: result.batchDir, index: shot.index })
+        if (!begun.ok) throw new Error(begun.error || '无法清理上一轮分镜进度')
         const gen = await buildGen(user, shot, preferredAccountId || null, { autoConfirm: isBatch })
         if (!gen) {
-          onToast?.('未获取到登录态')
+          const failed = await window.api.storyboard.markError({ batchDir: result.batchDir, index: shot.index })
+          onToast?.(failed.ok ? '未获取到登录态' : `未获取到登录态；进度写入失败：${failed.error || '未知错误'}`)
           setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
           return
         }
@@ -135,37 +157,22 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
           if (r.jobId && r.remoteUrl) {
             setRetryInfo((m) => ({ ...m, [shot.index]: { jobId: r.jobId!, remoteUrl: r.remoteUrl! } }))
           }
-          if (r.accountId) {
-            setOpenInfo((m) => ({ ...m, [shot.index]: r.accountId! }))
-            if (!r.remoteUrl && !isBatch) {
-              // 批量模式跳过自动拉取：避免拖慢批量 + 拉取串台，失败留给批量结束后的手动兜底
-              setRetryMsg((m) => ({ ...m, [shot.index]: '自动拉取中…' }))
-              onToast?.(`分镜 ${shot.index} 生成失败，自动拉取豆包最新视频中…`)
-              const auto = await window.api.storyboard.autoRetry({ keyId: r.accountId, batchDir: result.batchDir, index: shot.index, maxAttempts: 3 })
-              if (auto.ok && auto.videoPath) {
-                setVideos((v) => ({ ...v, [shot.index]: auto.videoPath! }))
-                setStatusMap((m) => ({ ...m, [shot.index]: 'done' as ShotStatus }))
-                setRetryMsg((m) => {
-                  const n = { ...m }
-                  delete n[shot.index]
-                  return n
-                })
-                onToast?.(`分镜 ${shot.index} 自动拉取成功`)
-                return
-              }
-              setRetryMsg((m) => ({ ...m, [shot.index]: '自动拉取失败，请手动处理' }))
-              onToast?.(`分镜 ${shot.index} 自动拉取失败，请手动处理`)
-            }
-          }
+          if (r.accountId) setOpenInfo((m) => ({ ...m, [shot.index]: r.accountId! }))
           onToast?.(`分镜 ${shot.index} 失败：${r.error || '未知'}`)
           setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
         }
       } catch (e) {
-        onToast?.(`分镜 ${shot.index} 异常：${e instanceof Error ? e.message : String(e)}`)
+        const error = e instanceof Error ? e.message : String(e)
+        const failed = await window.api.storyboard.markError({ batchDir: result.batchDir, index: shot.index }).catch((markError) => ({ ok: false, error: markError instanceof Error ? markError.message : String(markError) }))
+        onToast?.(failed.ok
+          ? `分镜 ${shot.index} 异常：${error}`
+          : `分镜 ${shot.index} 异常：${error}；进度写入失败：${failed.error || '未知错误'}`)
         setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
+      } finally {
+        setActiveShotIndex(null)
       }
     },
-    [result, user, onToast, preferredAccountId]
+    [result, user, onToast, preferredAccountId, activeShotIndex]
   )
 
   const retryDownload = useCallback(
@@ -358,8 +365,13 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
           ]}
           style={{ minWidth: 210 }}
         />
-        <button className="btn" onClick={generateAll} disabled={!result || generating} title="跳过逐段审核，一次生成全部片段（备用）">
-          {generating ? `批量生成中 ${doneCount}/${total}` : '批量生成全部'}
+        <button
+          className="btn"
+          onClick={generateAll}
+          disabled={!BATCH_GENERATION_ENABLED || !result || generating}
+          title="批量生成逻辑已保留，待普通逐段流程实机验收通过后开放"
+        >
+          {generating ? `批量生成中 ${doneCount}/${total}` : '批量生成（暂未开放）'}
         </button>
       </div>
 
@@ -372,7 +384,7 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
 
       {result && (
         <div className="storyboard-hint">
-          逐段审核下方分镜词与匹配资源，点每段的「生成」按钮单段生成；确认无误可点上方「批量生成全部」。
+          当前仅开放逐段生成：审核下方分镜词与匹配资源后，点击每段的「生成」。批量逻辑继续维护并记录进度，待普通流程实机验收通过后开放入口。
         </div>
       )}
 
@@ -405,7 +417,7 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
                       setConfirmRegen(null)
                       void generateOne(shot)
                     }}
-                    disabled={st === 'running' || generating}
+                    disabled={st === 'running' || generating || activeShotIndex !== null}
                   >
                     {st === 'done'
                       ? confirmRegen === shot.index
@@ -415,9 +427,6 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
                         ? '生成中…'
                         : '生成'}
                   </button>
-                  {retryMsg[shot.index] && (
-                    <span className="shot-retry-msg">{retryMsg[shot.index]}</span>
-                  )}
                   <span className={`shot-status status-${st}`}>
                     {st === 'done' ? '✓' : st === 'running' ? '…' : st === 'error' ? '✗' : '待'}
                   </span>
@@ -426,7 +435,7 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
                       补下载
                     </button>
                   )}
-                  {st === 'error' && (
+                  {st === 'error' && openInfo[shot.index] && (
                     <button className="btn btn-sm" onClick={() => void openDoubao(shot)} disabled={generating}>
                       打开豆包
                     </button>

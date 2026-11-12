@@ -180,16 +180,20 @@ const uploadImagesScript = (dataUrls: string[]): unknown => {
     for (let i = 0; i < dataUrls.length; i++) {
       let file: File | null = null
       try {
-        const resp = await fetch(dataUrls[i])
-        const blob = await resp.blob()
-        const ext = blob.type.includes('png')
+        const matched = dataUrls[i].match(/^data:([^;,]+);base64,([\s\S]+)$/)
+        if (!matched) throw new Error('无效的图片数据')
+        const mime = matched[1] || 'image/jpeg'
+        const binary = atob(matched[2])
+        const bytes = new Uint8Array(binary.length)
+        for (let j = 0; j < binary.length; j++) bytes[j] = binary.charCodeAt(j)
+        const ext = mime.includes('png')
           ? 'png'
-          : blob.type.includes('gif')
+          : mime.includes('gif')
             ? 'gif'
-            : blob.type.includes('webp')
+            : mime.includes('webp')
               ? 'webp'
               : 'jpg'
-        file = new File([blob], 'image-' + i + '.' + ext, { type: blob.type || 'image/jpeg' })
+        file = new File([bytes], 'image-' + i + '.' + ext, { type: mime })
       } catch {}
       if (!file) {
         results.push({ ok: false, reason: '图片数据解析失败' })
@@ -299,7 +303,7 @@ const insertPromptAndSubmitScript = (prompt: string): unknown => {
     // 追加 prompt 并校验确实落进编辑器：图生视频会在图片 chip 后追加一段提示词，
     // 之前没校验，插入失败仍返回 ok → 调度台误显示「排队中」但提示词根本没进输入框。
     const headCore = prompt.split(/[，,]/)[0].substring(0, 6)
-    let inserted = false
+    let inserted = norm(editor.innerText || editor.textContent || '').includes(headCore)
     for (let i = 0; i < 4 && !inserted; i++) {
       editor.focus()
       try {
@@ -331,8 +335,7 @@ const insertPromptAndSubmitScript = (prompt: string): unknown => {
     editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }))
     await sleep(1500)
     const editorAfter = norm(editor.innerText || editor.textContent || '')
-    const pageText = document.body ? document.body.innerText : ''
-    const sent = !editorAfter.includes(headCore) || pageText.lastIndexOf(prompt) >= 0
+    const sent = !editorAfter.includes(headCore)
     return sent ? { ok: true } : { ok: false, reason: '已触发提交但页面未确认提示词发送成功' }
   })()
 }
@@ -369,8 +372,7 @@ const appendAndSubmitTextScript = (text: string): unknown => {
     editor.dispatchEvent(new KeyboardEvent('keyup', enter))
     await sleep(1200)
     const editorAfter = (editor.innerText || editor.textContent || '').trim()
-    const pageText = document.body ? document.body.innerText : ''
-    const sent = !editorAfter.includes(text) || pageText.lastIndexOf(text) >= 0
+    const sent = !editorAfter.includes(text)
     return sent ? { ok: true } : { ok: false, reason: '页面未确认二次确认消息发送成功' }
   })()
 }
@@ -468,8 +470,7 @@ const fillAndSubmitScript = (prompt: string): unknown => {
     editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }))
     await sleep(1500)
     const editorAfter = norm(editor.innerText || editor.textContent || '')
-    const pageText = document.body ? document.body.innerText : ''
-    const sent = !editorAfter.includes(headCore) || pageText.lastIndexOf(prompt) >= 0
+    const sent = !editorAfter.includes(headCore)
     return sent
       ? { ok: true, submitted: true }
       : { ok: false, submitted: false, reason: '已触发提交但页面未确认提示词发送成功' }
@@ -1622,11 +1623,12 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   }
 
   const durationSec = options.durationSec === 10 ? 10 : options.durationSec === 15 ? 15 : 5
-  // 时长：真实 UI 滑块（Radix Slider），避免「5秒 文本 vs 10s chip」双时长冲突；设置失败不阻断
+  // 时长必须真实生效；否则继续上传会用错误时长生成。
   progress(options, 'apply-duration', { durationSec })
   const durApply = await applyDoubaoDuration(win, durationSec)
   if (!durApply.ok) {
-    // 时长设置失败：不阻断任务，跳过时长调整，继续发送
+    closeWindow('submit-failed', { stage: 'apply-duration', durationSec, reason: durApply.reason || null })
+    return fail(`未能设置为 ${durationSec} 秒：${durApply.reason || '时长选择失败'}，窗口已保留`)
   }
 
   // 比例：真实 UI 网格点击；失败时回退文本拼接（页面结构变化时不阻断任务）

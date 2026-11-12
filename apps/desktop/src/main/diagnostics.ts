@@ -1,12 +1,18 @@
 import { app } from 'electron'
 import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, win32 } from 'node:path'
 
 const MAX_LOG_BYTES = 5 * 1024 * 1024
 const KEEP_LOG_BYTES = 1 * 1024 * 1024
 
+export function resolveGenerationLogPath(platform: NodeJS.Platform, exePath: string, userDataPath: string): string {
+  return platform === 'win32'
+    ? win32.join(win32.dirname(exePath), 'qf-generation.log')
+    : join(userDataPath, 'qf-generation.log')
+}
+
 function logPath(): string {
-  return join(app.getPath('userData'), 'qf-generation.log')
+  return resolveGenerationLogPath(process.platform, app.getPath('exe'), app.getPath('userData'))
 }
 
 function trimLogIfNeeded(file: string): void {

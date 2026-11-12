@@ -657,7 +657,7 @@ export async function runGenerate(
           })
           break
         }
-        if (/未登录|登录|API Key/.test(lastError)) {
+        if (input.preferredAccountId || /未登录|登录|API Key/.test(lastError)) {
           try {
             await providerSvc.updateHealth(input.userId, cand.id, 'expired')
             // 健康态变了会直接影响后续生成的选号排序，立即失效该 key 所在分区缓存

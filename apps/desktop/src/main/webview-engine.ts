@@ -326,6 +326,31 @@ const insertPromptAndSubmitScript = (prompt: string): unknown => {
 
 // 豆包可能以「聊天回复」的形式要求先确认参数（如「确认后我再开始生成视频」），此时视频并未开始生成、
 // 也没有可点的弹窗。用此脚本检测页面是否出现这类「等待确认」回复，供主进程决定是否回一条确认。
+// 确认回复必须追加到当前对话输入框，不能复用会清空编辑器/图片状态的主 prompt 提交脚本。
+const appendAndSubmitTextScript = (text: string): unknown => {
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+  const findEditor = (): HTMLElement | null => {
+    for (const selector of ['[class*="ProseMirror"]', '[class*="tiptap"]', '[contenteditable="true"]', '[role="textbox"]']) {
+      const editor = [...document.querySelectorAll<HTMLElement>(selector)].find((el) => el.offsetParent !== null)
+      if (editor) return editor
+    }
+    return null
+  }
+  return (async () => {
+    const editor = findEditor()
+    if (!editor) return { ok: false, reason: '未找到确认输入框' }
+    editor.focus()
+    document.execCommand('insertText', false, text)
+    editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }))
+    const enter = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }
+    editor.dispatchEvent(new KeyboardEvent('keydown', enter))
+    editor.dispatchEvent(new KeyboardEvent('keypress', enter))
+    editor.dispatchEvent(new KeyboardEvent('keyup', enter))
+    await sleep(1200)
+    return { ok: true }
+  })()
+}
+
 const detectConfirmRequestScript = (): boolean => {
   const t = document.body ? document.body.innerText : ''
   return /确认后我再开始生成视频|我将按最终要求生成|视频生成参数确认|确认以上参数|请确认以上方案/.test(t)
@@ -1783,7 +1808,7 @@ export async function runDoubaoGeneration(options: DoubaoGenerateOptions): Promi
           // 批量模式：自动回「确认，直接开始生成」，不弹窗人工确认
           progress(options, 'risk-verify', { message: '豆包要求确认参数，已自动确认' })
           try {
-            const confirmRes = (await win.webContents.executeJavaScript('(' + fillAndSubmitScript.toString() + ')(' + JSON.stringify('确认，直接开始生成') + ')', true)) as { ok?: boolean; reason?: string } | undefined
+            const confirmRes = (await win.webContents.executeJavaScript('(' + appendAndSubmitTextScript.toString() + ')(' + JSON.stringify('确认，直接开始生成') + ')', true)) as { ok?: boolean; reason?: string } | undefined
             if (!confirmRes || confirmRes.ok !== true) {
               // 自动确认失败（未找到输入框 / 内容未写入）→ 弹窗交人工兜底
               showRiskWindow(win)

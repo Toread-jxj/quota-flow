@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useCallback, useMemo } from 'react'
 import type { ChangeEvent as ReactChangeEvent, ClipboardEvent as ReactClipboardEvent } from 'react'
 import { createPortal } from 'react-dom'
 import {
+  DEFAULT_DOUBAO_MODEL,
   DEFAULT_SUPPORTED_DURATIONS,
   MODELS,
   computeCost,
@@ -257,7 +258,7 @@ export default function Dashboard({
   // 「最近生成」面板用独立 recent（首页最近10条），不与历史记录分页/筛选联动，翻页不再影响调度台
   const { recent: jobItems, reload: reloadJobs } = jobs
   const [provider, setProvider] = useState('doubao')
-  const [model, setModel] = useState(MODELS.doubao[0])
+  const [model, setModel] = useState(DEFAULT_DOUBAO_MODEL)
   const [preferredAccountId, setPreferredAccountId] = useState('')
   const [mode, setMode] = useState('text2video')
   const [duration, setDuration] = useState(5)

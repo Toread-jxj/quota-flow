@@ -60,7 +60,7 @@ export interface DoubaoGenerateOptions {
   prompt: string
   /** 生成模式：text2video / img2video（当前支持） */
   mode?: string
-  /** 模型：Seedance 2.0 Mini / Seedance 2.0 Fast（默认 Mini；通过豆包页面模型选择器真实操作） */
+  /** 模型：Seedance 2.0 Mini / Seedance 2.0 Fast（客户端默认 Fast；通过豆包页面模型选择器真实操作） */
   model?: string
   /** 清晰度：豆包规格无清晰度维度，仅透传记录 */
   resolution?: string

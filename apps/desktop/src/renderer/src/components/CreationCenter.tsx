@@ -6,11 +6,12 @@ import { useCommunityVideos, type CommunityVideo } from '../hooks/useCommunityVi
 import MaterialLibrary from './MaterialLibrary'
 import type { RegenerateDraft } from './Dashboard'
 import { IconClose, IconGrid, IconPlay, IconSparkles } from './icons'
+import { DEFAULT_DOUBAO_MODEL } from '../spec'
 
 const DEFAULT_COMMUNITY_DRAFT: RegenerateDraft = {
   prompt: '',
   providerId: 'doubao',
-  model: 'Seedance 2.0 Mini',
+  model: DEFAULT_DOUBAO_MODEL,
   durationSec: 5,
   resolution: '720',
   audio: 'on',

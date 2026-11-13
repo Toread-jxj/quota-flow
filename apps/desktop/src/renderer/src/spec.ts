@@ -12,8 +12,10 @@ export const PROVIDER_LABEL: Record<string, string> = {
   tokenhub: '腾讯云TokenHub'
 }
 
+export const DEFAULT_DOUBAO_MODEL = 'Seedance 2.0 Fast'
+
 export const MODELS: Record<string, string[]> = {
-  doubao: ['Seedance 2.0 Mini', 'Seedance 2.0 Fast'],
+  doubao: [DEFAULT_DOUBAO_MODEL, 'Seedance 2.0 Mini'],
   qwen: ['万相 2.7', '万相 2.6', 'HappyHorse 1.0 Beta'],
   qwenwan: ['万相 2.7', '万相 2.6', 'HappyHorse 1.0 Beta'],
   yuanbao: ['混元'],

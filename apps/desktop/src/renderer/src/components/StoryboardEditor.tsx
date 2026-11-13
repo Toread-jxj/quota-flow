@@ -8,6 +8,7 @@ import { IconSparkles } from './icons'
 import { getInitialShowWebview } from './Modals'
 import { initializePromptDrafts, promptForGeneration, updatePromptDraft } from './storyboard-prompt-policy'
 import { buildStoryboardAccountOption } from './storyboard-account-policy'
+import { DEFAULT_DOUBAO_MODEL } from '../spec'
 
 interface StoryboardEditorProps {
   user: AuthUser
@@ -33,6 +34,7 @@ async function buildGen(user: AuthUser, shot: StoryboardShot, preferredAccountId
     userId: user.id,
     prompt: shot.prompt,
     providerId: 'doubao',
+    model: DEFAULT_DOUBAO_MODEL,
     durationSec: shot.durationSec,
     mode: shot.images.length > 0 ? 'img2video' : 'text2video',
     images: shot.images,

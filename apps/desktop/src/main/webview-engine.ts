@@ -9,6 +9,7 @@
 import { BrowserWindow, session } from 'electron'
 import { logGeneration } from './diagnostics'
 import {
+  raceDoubaoOperationWithClose,
   shouldAbortDoubaoUpload,
   shouldCloseDoubaoWindow,
   type DoubaoWindowTerminalReason
@@ -1397,6 +1398,8 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   const cancelState = options.cancel
   let userClosed = false
   let terminalCloseRequested = false
+  let signalWindowClosed!: () => void
+  const windowClosed = new Promise<void>((resolve) => { signalWindowClosed = resolve })
   const failUserClosed = (): DoubaoGenerateResult => {
     attempts.push({ providerId: 'doubao', ok: false, errorMessage: '豆包窗口被用户关闭，生成未完成' })
     return { ok: false, providerId: 'doubao', error: '豆包窗口被用户关闭，生成未完成', attempts }
@@ -1471,9 +1474,13 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   })
 
   let loadError: { code: number; desc: string; url: string } | null = null
-  win.on('closed', () => {
+  win.on('close', () => {
     if (terminalCloseRequested) return
     userClosed = true
+    signalWindowClosed()
+  })
+  win.on('closed', () => {
+    if (terminalCloseRequested) return
     trace('window-closed-by-user', { stage: 'webview' })
   })
   win.webContents.on('did-fail-load', (_e, code, desc, url) => {
@@ -1511,7 +1518,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   // 注入当前页面 origin 的 storage，然后刷新页面
   if (effectiveStorages.length > 0) {
     try {
-      await win.webContents.executeJavaScript(
+      const storageOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript(
         `(() => {
           const all = ${JSON.stringify(effectiveStorages)};
           const main = all.find((s) => location.origin === s.origin) || all.find((s) => (s.origin || '').includes('doubao.com'));
@@ -1527,18 +1534,24 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
           }
         })()`,
         true
-      )
-      await win.webContents.executeJavaScript('location.reload()', true)
+      ), windowClosed)
+      if (!('value' in storageOperation)) return failUserClosed()
+      const reloadOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript('location.reload()', true), windowClosed)
+      if (!('value' in reloadOperation)) return failUserClosed()
       if (await waitOrAbort(3500)) return abortNow()
     } catch {
+      if (userClosed) return failUserClosed()
       // storage 注入失败不阻断，页面可能仅依赖 cookie
     }
   }
 
   let inspect: { inputFound?: boolean; inputTag?: string; hasLogin?: boolean; hasLoginWall?: boolean; hasUserInfo?: boolean; url?: string } = {}
   try {
-    inspect = (await win.webContents.executeJavaScript('(' + inspectScript.toString() + ')()', true)) as typeof inspect
+    const inspectOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript('(' + inspectScript.toString() + ')()', true), windowClosed)
+    if (!('value' in inspectOperation)) return failUserClosed()
+    inspect = inspectOperation.value as typeof inspect
   } catch {
+    if (userClosed) return failUserClosed()
     inspect = {}
   }
   if (loadError || !inspect.inputFound) {
@@ -1557,8 +1570,11 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
 
   // 风控探针：包装 /chat/completion 响应 + DOM 验证 UI 检测（提交前挂载）
   try {
-    await win.webContents.executeJavaScript('(' + riskProbeScript.toString() + ')()', true)
-  } catch {}
+    const riskProbeOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript('(' + riskProbeScript.toString() + ')()', true), windowClosed)
+    if (!('value' in riskProbeOperation)) return failUserClosed()
+  } catch {
+    if (userClosed) return failUserClosed()
+  }
 
   {
     const aborted = abortIfCancelled()
@@ -1569,7 +1585,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   let tabReady = false
   for (let i = 0; i < 15; i++) {
     try {
-      const r = await win.webContents.executeJavaScript(
+      const tabOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript(
         `(() => {
           const norm = (s) => (s || '').trim();
           const textOf = (b) => norm(b.textContent || '') || norm(b.getAttribute('aria-label') || '') || norm(b.getAttribute('title') || '');
@@ -1580,12 +1596,15 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
           });
         })()`,
         true
-      )
-      if (r) {
+      ), windowClosed)
+      if (!('value' in tabOperation)) return failUserClosed()
+      if (tabOperation.value) {
         tabReady = true
         break
       }
-    } catch {}
+    } catch {
+      if (userClosed) return failUserClosed()
+    }
     if (await waitOrAbort(1000)) return abortNow()
   }
   if (!tabReady) {
@@ -1602,27 +1621,37 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   let entered = false
   for (let attempt = 0; attempt < 2 && !entered; attempt++) {
     try {
-      await win.webContents.executeJavaScript(
+      const escapeOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript(
         `(() => { document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); })()`,
         true
-      )
-    } catch {}
+      ), windowClosed)
+      if (!('value' in escapeOperation)) return failUserClosed()
+    } catch {
+      if (userClosed) return failUserClosed()
+    }
     if (await waitOrAbort(500)) return abortNow()
     try {
-      await win.webContents.executeJavaScript('(' + openVideoTabScript.toString() + ')()', true)
-    } catch {}
+      const openTabOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript('(' + openVideoTabScript.toString() + ')()', true), windowClosed)
+      if (!('value' in openTabOperation)) return failUserClosed()
+    } catch {
+      if (userClosed) return failUserClosed()
+    }
     for (let i = 0; i < 8; i++) {
       if (await waitOrAbort(1500)) return abortNow()
       try {
-        const vv = (await win.webContents.executeJavaScript(
+        const inspectTabOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript(
           '(' + inspectScript.toString() + ')()',
           true
-        )) as { inputFound?: boolean; inputTag?: string }
+        ), windowClosed)
+        if (!('value' in inspectTabOperation)) return failUserClosed()
+        const vv = inspectTabOperation.value as { inputFound?: boolean; inputTag?: string }
         if (vv && vv.inputFound && vv.inputTag === 'div') {
           entered = true
           break
         }
-      } catch {}
+      } catch {
+        if (userClosed) return failUserClosed()
+      }
     }
   }
   if (!entered) {
@@ -1636,8 +1665,9 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   // 模型：真实 UI 模型选择器（页面无选择器/设置失败均不阻断，继续按提示词发送）
   if (options.model) {
     progress(options, 'apply-model', { model: options.model })
-    const modelApply = await applyDoubaoModel(win, options.model)
-    if (userClosed) return failUserClosed()
+    const modelOperation = await raceDoubaoOperationWithClose(applyDoubaoModel(win, options.model), windowClosed)
+    if (!('value' in modelOperation)) return failUserClosed()
+    const modelApply = modelOperation.value
     if (!modelApply.ok) {
       // 模型设置失败：不阻断任务，跳过模型切换，继续发送
     }
@@ -1646,8 +1676,9 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   const durationSec = options.durationSec === 10 ? 10 : options.durationSec === 15 ? 15 : 5
   // 时长必须真实生效；否则继续上传会用错误时长生成。
   progress(options, 'apply-duration', { durationSec })
-  const durApply = await applyDoubaoDuration(win, durationSec)
-  if (userClosed) return failUserClosed()
+  const durationOperation = await raceDoubaoOperationWithClose(applyDoubaoDuration(win, durationSec), windowClosed)
+  if (!('value' in durationOperation)) return failUserClosed()
+  const durApply = durationOperation.value
   if (!durApply.ok) {
     closeWindow('submit-failed', { stage: 'apply-duration', durationSec, reason: durApply.reason || null })
     return fail(`未能设置为 ${durationSec} 秒：${durApply.reason || '时长选择失败'}，窗口已保留`)
@@ -1656,7 +1687,9 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   // 比例：真实 UI 网格点击；失败时回退文本拼接（页面结构变化时不阻断任务）
   let ratioViaDom = false
   if (options.ratio) {
-    const ratioApply = await applyDoubaoRatio(win, options.ratio)
+    const ratioOperation = await raceDoubaoOperationWithClose(applyDoubaoRatio(win, options.ratio), windowClosed)
+    if (!('value' in ratioOperation)) return failUserClosed()
+    const ratioApply = ratioOperation.value
     if (ratioApply.ok) ratioViaDom = true
   }
 
@@ -1683,7 +1716,9 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   let baselineReady = false
   let preserveWindowVisible = false
   try {
-    const pre = (await win.webContents.executeJavaScript('(' + extractResultScript.toString() + ')()', true)) as {
+    const baselineOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript('(' + extractResultScript.toString() + ')()', true), windowClosed)
+    if (!('value' in baselineOperation)) return failUserClosed()
+    const pre = baselineOperation.value as {
       vids?: Array<{ src: string }>
       mp4s?: string[]
     }
@@ -1763,20 +1798,24 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
     progress(options, 'submit-img2video')
     trace('submit-start', { mode: 'img2video' })
     try {
-      fillResult = (await win.webContents.executeJavaScript(
+      const submitOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript(
         '(' + insertPromptAndSubmitScript.toString() + ')(' + JSON.stringify(submitPrompt) + ')',
         true
-      )) as typeof fillResult
+      ), windowClosed)
+      if (!('value' in submitOperation)) return failUserClosed()
+      fillResult = submitOperation.value as typeof fillResult
     } catch (e) {
       fillResult = { ok: false, reason: e instanceof Error ? e.message : String(e) }
     }
   } else {
     trace('submit-start', { mode: 'text2video' })
     try {
-      fillResult = (await win.webContents.executeJavaScript(
+      const submitOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript(
         '(' + fillAndSubmitScript.toString() + ')(' + JSON.stringify(submitPrompt) + ')',
         true
-      )) as typeof fillResult
+      ), windowClosed)
+      if (!('value' in submitOperation)) return failUserClosed()
+      fillResult = submitOperation.value as typeof fillResult
     } catch (e) {
       fillResult = { ok: false, reason: e instanceof Error ? e.message : String(e) }
     }
@@ -1796,7 +1835,9 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
 
   // 提交后检查风控：verify → 显示窗口交用户；limit → 直接失败
   if (await waitOrAbort(1500)) return abortNow()
-  let risk = await readDoubaoRisk(win)
+  const initialRiskOperation = await raceDoubaoOperationWithClose(readDoubaoRisk(win), windowClosed)
+  if (!('value' in initialRiskOperation)) return failUserClosed()
+  let risk = initialRiskOperation.value
   if (risk.type === 'limit') {
     closeWindow('rate-limited', { stage: 'post-submit-risk', detail: risk.detail || null })
     return fail('豆包风控/限流：' + (risk.detail || '请稍后再试'))
@@ -1814,11 +1855,15 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   // 内容政策拒绝：豆包返回侵权/肖像/版权等拒绝文案 → 直接失败（不扣额度）
   let submitCheck: { blockedText?: string | null } = {}
   try {
-    submitCheck = (await win.webContents.executeJavaScript(
+    const submitCheckOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript(
       '(' + extractResultScript.toString() + ')()',
       true
-    )) as typeof submitCheck
-  } catch {}
+    ), windowClosed)
+    if (!('value' in submitCheckOperation)) return failUserClosed()
+    submitCheck = submitCheckOperation.value as typeof submitCheck
+  } catch {
+    if (userClosed) return failUserClosed()
+  }
   if (submitCheck.blockedText) {
     closeWindow('blocked', { stage: 'post-submit-blocked' })
     return failBlocked(submitCheck.blockedText)
@@ -1843,15 +1888,22 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
       textTail?: string
     } = {}
     try {
-      r = (await win.webContents.executeJavaScript('(' + extractResultScript.toString() + ')()', true)) as typeof r
+      const extractOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript('(' + extractResultScript.toString() + ')()', true), windowClosed)
+      if (!('value' in extractOperation)) return failUserClosed()
+      r = extractOperation.value as typeof r
+      if (userClosed) return failUserClosed()
     } catch {
       r = {}
     }
     // 风控处理：verify → 弹窗交用户；limit → 失败；用户解决后恢复/隐藏
     let riskTick: { type: string; detail?: string | null } = { type: 'none' }
     try {
-      riskTick = await readDoubaoRisk(win)
-    } catch {}
+      const riskOperation = await raceDoubaoOperationWithClose(readDoubaoRisk(win), windowClosed)
+      if (!('value' in riskOperation)) return failUserClosed()
+      riskTick = riskOperation.value
+    } catch {
+      if (userClosed) return failUserClosed()
+    }
     if ((riskTick.type === 'verify' || riskTick.type === 'disclaimer') && !riskMode) {
       riskMode = true
       riskSince = Date.now()
@@ -1882,12 +1934,15 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
     if (!confirmReplied) {
       let needConfirm = false
       try {
-        const pageText = (await win.webContents.executeJavaScript(
+        const pageTextOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript(
           '(' + readPageTextScript.toString() + ')()',
           true
-        )) as string
+        ), windowClosed)
+        if (!('value' in pageTextOperation)) return failUserClosed()
+        const pageText = pageTextOperation.value as string
         needConfirm = hasConfirmRequestAfterPrompt(pageText, submitPrompt)
       } catch {
+        if (userClosed) return failUserClosed()
         needConfirm = false
       }
       if (needConfirm && !confirmRequested) {
@@ -1895,7 +1950,9 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
         trace('confirm-requested', { autoConfirm: !!options.autoConfirm })
         if (options.autoConfirm) {
           try {
-            const confirmRes = (await win.webContents.executeJavaScript('(' + appendAndSubmitTextScript.toString() + ')(' + JSON.stringify('确认，直接开始生成') + ')', true)) as { ok?: boolean; reason?: string } | undefined
+            const confirmOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript('(' + appendAndSubmitTextScript.toString() + ')(' + JSON.stringify('确认，直接开始生成') + ')', true), windowClosed)
+            if (!('value' in confirmOperation)) return failUserClosed()
+            const confirmRes = confirmOperation.value as { ok?: boolean; reason?: string } | undefined
             confirmReplied = !!confirmRes?.ok
             trace('confirm-result', { autoConfirm: true, ok: confirmReplied, reason: confirmRes?.reason ?? null })
             if (!confirmReplied) {
@@ -1905,6 +1962,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
               progress(options, 'waiting', { message: '豆包参数确认已发送，继续等待生成' })
             }
           } catch (e) {
+            if (userClosed) return failUserClosed()
             trace('confirm-result', { autoConfirm: true, ok: false, error: e })
             showRiskWindow(win)
             progress(options, 'risk-verify', { message: '自动确认异常，请在窗口中手动确认' })
@@ -1927,8 +1985,11 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
       if (doneTicks >= 2 && !cardClicked) {
         cardClicked = true
         try {
-          await win.webContents.executeJavaScript('(' + clickVideoCardScript.toString() + ')()', true)
-        } catch {}
+          const cardOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript('(' + clickVideoCardScript.toString() + ')()', true), windowClosed)
+          if (!('value' in cardOperation)) return failUserClosed()
+        } catch {
+          if (userClosed) return failUserClosed()
+        }
       }
     } else {
       doneTicks = 0
@@ -1939,6 +2000,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
     closeWindow('timeout', { waitedMs: Date.now() - started })
     return fail('等待超时未取到视频 URL')
   }
+  if (userClosed) return failUserClosed()
   closeWindow('success', { waitedMs: Date.now() - started, hasVideoUrl: true })
   attempts.push({ providerId: 'doubao', ok: true })
   return {

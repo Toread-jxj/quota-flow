@@ -12,9 +12,11 @@ describe('decideAccountRetry', () => {
       .toEqual({ retry: false, expireAccount: false, reason: 'page-or-submit-failure' })
   })
 
-  it('提交失败或等待超时时不切换账号', () => {
+  it('提交失败、等待超时或用户关窗时都不切换账号', () => {
     expect(decideAccountRetry('提示词未成功进入输入框，已中止以避免误报生成中', false, 'doubao').retry).toBe(false)
     expect(decideAccountRetry('等待超时未取到视频 URL', false, 'doubao').retry).toBe(false)
+    expect(decideAccountRetry('豆包窗口被用户关闭，生成未完成', false, 'doubao'))
+      .toEqual({ retry: false, expireAccount: false, reason: 'page-or-submit-failure' })
   })
 
   it('明确登录态失效时允许自动换号并标记账号失效', () => {

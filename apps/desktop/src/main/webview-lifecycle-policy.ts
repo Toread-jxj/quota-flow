@@ -8,6 +8,7 @@ export type DoubaoWindowTerminalReason =
   | 'timeout'
   | 'blocked'
   | 'rate-limited'
+  | 'user-closed'
 
 /** 只有明确取得本次视频 URL 才自动关闭；其他情况均显示并保留现场，由用户手动关闭。 */
 export function shouldCloseDoubaoWindow(reason: DoubaoWindowTerminalReason): boolean {

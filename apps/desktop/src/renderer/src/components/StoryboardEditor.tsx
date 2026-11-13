@@ -439,7 +439,9 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
                         : '✓ 重生成'
                       : st === 'running'
                         ? '生成中…'
-                        : '生成'}
+                        : st === 'error'
+                          ? '重新同步并生成'
+                          : '生成'}
                   </button>
                   <span className={`shot-status status-${st}`}>
                     {st === 'done' ? '✓' : st === 'running' ? '…' : st === 'error' ? '✗' : '待'}

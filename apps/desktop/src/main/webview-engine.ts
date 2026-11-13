@@ -1367,6 +1367,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
     const close = shouldCloseDoubaoWindow(reason)
     trace('window-decision', { reason, close, detail })
     if (!win || win.isDestroyed()) return
+    terminalCloseRequested = close
     if (!close) {
       retainGenerationWindow(options.keyId, win)
       try {
@@ -1390,6 +1391,12 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   }
   let win: BrowserWindow | null = null
   const cancelState = options.cancel
+  let userClosed = false
+  let terminalCloseRequested = false
+  const failUserClosed = (): DoubaoGenerateResult => {
+    attempts.push({ providerId: 'doubao', ok: false, errorMessage: '豆包窗口被用户关闭，生成未完成' })
+    return { ok: false, providerId: 'doubao', error: '豆包窗口被用户关闭，生成未完成', attempts }
+  }
   const failCancelled = (): DoubaoGenerateResult => {
     attempts.push({ providerId: 'doubao', ok: false, errorMessage: '已手动终止生成（提示词未发送）' })
     return { ok: false, providerId: 'doubao', cancelled: true, error: '已手动终止生成（提示词未发送）', attempts }
@@ -1405,12 +1412,15 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
     const step = 200
     const end = Date.now() + ms
     while (Date.now() < end) {
-      if (cancelState?.aborted) return true
+      if (cancelState?.aborted || userClosed) return true
       await sleep(Math.min(step, end - Date.now()))
     }
-    return cancelState?.aborted === true
+    return cancelState?.aborted === true || userClosed
   }
-  const abortNow = (): DoubaoGenerateResult => abortIfCancelled() ?? failCancelled()
+  const abortNow = (): DoubaoGenerateResult => {
+    if (userClosed) return failUserClosed()
+    return abortIfCancelled() ?? failCancelled()
+  }
 
   if (options.mode && options.mode !== 'text2video' && options.mode !== 't2v' && options.mode !== 'img2video') {
     return fail('暂仅支持文生视频/图生视频（豆包），当前模式：' + options.mode)
@@ -1457,6 +1467,11 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   })
 
   let loadError: { code: number; desc: string; url: string } | null = null
+  win.on('closed', () => {
+    if (terminalCloseRequested) return
+    userClosed = true
+    trace('window-closed-by-user', { stage: 'webview' })
+  })
   win.webContents.on('did-fail-load', (_e, code, desc, url) => {
     // ERR_ABORTED(-3) 是页面被中止/重定向/重载的预期内结果（如 storage 注入后的 location.reload、
     // SPA 内部跳转），不代表真正加载失败。忽略它，避免把正常页面误判成「加载失败」。
@@ -1476,6 +1491,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
     loadError = { code: -1, desc: e instanceof Error ? e.message : String(e), url: DOUBAO_URL }
   }
   if (await waitOrAbort(4000)) return abortNow()
+  if (userClosed) return failUserClosed()
 
   // 归一化 effectiveStorages：优先用 storages（v2 多 origin），否则 fallback localStorage（v1）
   const effectiveStorages: OriginStorage[] = []
@@ -1617,6 +1633,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   if (options.model) {
     progress(options, 'apply-model', { model: options.model })
     const modelApply = await applyDoubaoModel(win, options.model)
+    if (userClosed) return failUserClosed()
     if (!modelApply.ok) {
       // 模型设置失败：不阻断任务，跳过模型切换，继续发送
     }
@@ -1626,6 +1643,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   // 时长必须真实生效；否则继续上传会用错误时长生成。
   progress(options, 'apply-duration', { durationSec })
   const durApply = await applyDoubaoDuration(win, durationSec)
+  if (userClosed) return failUserClosed()
   if (!durApply.ok) {
     closeWindow('submit-failed', { stage: 'apply-duration', durationSec, reason: durApply.reason || null })
     return fail(`未能设置为 ${durationSec} 秒：${durApply.reason || '时长选择失败'}，窗口已保留`)
@@ -1770,7 +1788,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   if (cancelState) cancelState.submitted = true
 
   // 提交后检查风控：verify → 显示窗口交用户；limit → 直接失败
-  await sleep(1500)
+  if (await waitOrAbort(1500)) return abortNow()
   let risk = await readDoubaoRisk(win)
   if (risk.type === 'limit') {
     closeWindow('rate-limited', { stage: 'post-submit-risk', detail: risk.detail || null })
@@ -1809,7 +1827,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   let final: { videoUrl?: string; posterUrl?: string | null } | null = null
 
   while (Date.now() - started < maxWaitMs) {
-    await sleep(5000)
+    if (await waitOrAbort(5000)) return abortNow()
     let r: {
       vids?: Array<{ src: string; poster?: string }>
       mp4s?: string[]

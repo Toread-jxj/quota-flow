@@ -18,5 +18,6 @@ describe('shouldCloseDoubaoWindow', () => {
     expect(shouldCloseDoubaoWindow('timeout')).toBe(false)
     expect(shouldCloseDoubaoWindow('blocked')).toBe(false)
     expect(shouldCloseDoubaoWindow('rate-limited')).toBe(false)
+    expect(shouldCloseDoubaoWindow('user-closed')).toBe(false)
   })
 })

@@ -46,6 +46,8 @@ export interface StoryboardParseResult {
 
 // ---- 常量 ----
 const DUR_SLOTS = [5, 10, 15]
+// 分镜时码是制作估值，15 秒目标段可能因小数累计略超 15 秒；1 秒内仍按单个 15 秒任务处理。
+const MAX_DURATION_DRIFT_SEC = 1
 // 时码/秒区间里的破折号统一兼容 em-dash — / en-dash – / 连字符 -
 const DASH = '[-–—]'
 
@@ -257,7 +259,7 @@ export function parseStoryboardText(text: string): StoryboardShot[] {
       prompt: buildRawPrompt(body, refs, refLabels)
     })
 
-    if (dur <= 15 || lens.length <= 1) {
+    if (dur <= 15 + MAX_DURATION_DRIFT_SEC || lens.length <= 1) {
       shots.push(mk(id, title, lens, dials, lens.map((x) => x.action), dials))
     } else {
       let cum = 0

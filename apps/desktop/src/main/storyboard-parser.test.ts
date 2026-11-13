@@ -95,6 +95,21 @@ describe('parseStoryboardText', () => {
     expect(shots[0].prompt).toContain('【固定镜头2｜6.00—15.00秒】')
   })
 
+  it('内部镜头识别异常时仍以分段标题总时长同步到 15 秒档', () => {
+    const text = `## V012｜汤姆的求婚｜全片02:45—03:00.54
+
+【A层｜项目、版本与生成任务】本视频15.54秒，内含四固定镜头，不拆称四次生成。
+
+【固定镜头一｜0.00—2.13秒】动作已完成。
+【固定镜头二｜2.13—9.29秒】继续播放。
+【固定镜头三｜9.29—13.41秒】人物聆听。
+【固定镜头四｜13.41—15.54秒】保持末态。
+`
+    const shots = parseStoryboardText(text)
+    expect(shots).toHaveLength(1)
+    expect(shots[0]).toMatchObject({ id: 'V012', durationSec: 15 })
+  })
+
   it('完整量产文件解析为43个任务且每段保留4个内部镜头', () => {
     const fixture = process.env.QF_STORYBOARD_FIXTURE
     if (!fixture) return

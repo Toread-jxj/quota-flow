@@ -447,6 +447,25 @@ async function collectPartitionCookies(providerId: string, keyId?: string): Prom
   return exportCookies(all)
 }
 
+/**
+ * 从当前机器的账号持久化分区重新采集有效 Cookie，并用当前机器 safeStorage 重建数据库凭据。
+ * 用于数据库密文不可解、但 WebView 已确认该分区仍处于登录状态时自愈。
+ */
+export async function capturePersistedProviderCredentials(
+  providerId: string,
+  keyId: string
+): Promise<{ encryptedKey: string; expiresAt: string | null }> {
+  const cookies = await collectPartitionCookies(providerId, keyId)
+  if (cookies.length === 0 || !hasAccountIdentityCookie(providerId, cookies)) {
+    throw new Error('持久化分区中未检测到有效账号 Cookie')
+  }
+  const maxExp = Math.max(...cookies.map((cookie) => Number(cookie.expires) || 0))
+  return {
+    encryptedKey: encryptCookies(cookies, [], providerId),
+    expiresAt: maxExp > 0 ? new Date(maxExp).toISOString() : null
+  }
+}
+
 async function injectCookies(
   providerId: string,
   cookies: ProviderCookie[],

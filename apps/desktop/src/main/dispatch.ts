@@ -11,7 +11,7 @@ import type { QuotaLedgerRow } from '@quota-flow/db-supabase'
 import { runDoubaoGeneration } from './webview-engine'
 import type { ProviderCookie, OriginStorage } from './webview-engine'
 import { resolveFfmpegPath } from './watermark-remover/engine'
-import { parseStoredCredentials as parseProviderCredentials } from './providers'
+import { capturePersistedProviderCredentials, parseStoredCredentials as parseProviderCredentials } from './providers'
 import { clearVolcModelUnavailable, markVolcModelUnavailable } from './providers'
 import { runQwenGeneration } from './qwen-webview'
 import { runYuanbaoGeneration } from './yuanbao-webview'
@@ -26,7 +26,12 @@ import {
 } from './query-cache'
 import { withElectronNet } from './supabase-network'
 import { findNextProviderAccount } from './account-selection'
-import { decideAccountRetry } from './account-retry-policy'
+import {
+  decideAccountRetry,
+  shouldBlockPreferredAccountBeforeWebview,
+  shouldMarkAccountHealthyAfterWebview,
+  shouldUsePersistedPartitionAfterCredentialFailure
+} from './account-retry-policy'
 import { logGeneration } from './diagnostics'
 
 export interface GenerateInput {
@@ -508,13 +513,17 @@ export async function runGenerate(
           return { ok: false, jobId: job.id, error: msg, accountId: input.preferredAccountId ?? null }
         }
         if (!preferred) return await prefFail('指定的账号不存在或已解绑，请换账号或改回「自动」')
-        if (preferred.health_status === 'expired') return await prefFail(`账号「${preferred.account_name || '未命名'}」登录态已失效，请换账号或改回「自动」`)
-        // 手工指定 = 人工授权：忽略当日时长上限（B 方案），仅校验账号存在与登录态
+        if (shouldBlockPreferredAccountBeforeWebview(resolvedProviderId, preferred.health_status)) {
+          return await prefFail(`账号「${preferred.account_name || '未命名'}」登录态已失效，请换账号或改回「自动」`)
+        }
+        // 豆包旧健康标记交给对应持久化分区实际验证；其他厂商仍按原状态拦截。
+        // 手工指定 = 人工授权：忽略当日时长上限（B 方案），仅校验账号存在与实际登录态
         sorted.length = 0
         sorted.push(preferred)
       }
 
       const tried = new Set<string>()
+      const credentialFallbackAccounts = new Set<string>()
       for (let round = 0; round < Math.min(providerKeys.length, 3); round++) {
         const cand = findNextProviderAccount(sorted, tried, remainingOf, cost, input.preferredAccountId)
         if (!cand) {
@@ -537,28 +546,24 @@ export async function runGenerate(
         }
         if (!c || c.length === 0) {
           lastError = `账号「${cand.account_name || '未命名'}」cookie 解密失败`
-          if (resolvedProviderId === 'doubao') {
-            // 豆包失败恢复必须保留账号 ID，确保人工兜底使用原账号 partition。
+          if (shouldUsePersistedPartitionAfterCredentialFailure(resolvedProviderId)) {
+            // 豆包账号分区可能仍有有效登录态：不提前封禁、不换号，交给 WebView 实际验证。
             selectedKey = { id: cand.id, accountName: cand.account_name }
-            const retry = !input.preferredAccountId
-            try {
-              await providerSvc.updateHealth(input.userId, cand.id, 'expired')
-              invalidateKeysByKeyId(cand.id)
-            } catch (e) {
-              logGeneration('account-health-update-failed', { jobId: job.id, accountId: cand.id, error: e })
-            }
-            logGeneration('account-retry-decision', {
+            credentialFallbackAccounts.add(cand.id)
+            c = []
+            s = []
+            storages = []
+            logGeneration('account-credential-fallback', {
               jobId: job.id,
               accountId: cand.id,
-              error: lastError,
-              retry,
-              expireAccount: true,
-              reason: input.preferredAccountId ? 'preferred-account-locked' : 'account-auth-failure'
+              providerId: resolvedProviderId,
+              partition: `persist:qf-p:${resolvedProviderId}:${cand.id}`,
+              reason: 'database-credential-decrypt-failed'
             })
-            if (!retry) break
+          } else {
+            // 非豆包厂商保持既有行为：凭据解密失败时继续候选账号，不附加健康态变更。
+            continue
           }
-          // 非豆包厂商保持本轮修改前的既有行为：凭据解密失败时继续候选账号，不附加健康态变更。
-          continue
         }
         selectedKey = { id: cand.id, accountName: cand.account_name }
         logGeneration('account-attempt-start', {
@@ -649,6 +654,7 @@ export async function runGenerate(
               emit({ jobId: job.id, status: 'running', stage, message: stage, data: detail })
           })
         } else {
+          let credentialHeal: Promise<void> | null = null
           result = await runDoubaoGeneration({
             cookies,
             localStorage: s,
@@ -670,9 +676,44 @@ export async function runGenerate(
                 ? { ...(detail as Record<string, unknown>), prompt: undefined, submitPrompt: undefined }
                 : detail
               logGeneration('webview-stage', { jobId: job.id, accountId: cand.id, providerId: resolvedProviderId, stage, detail: diagnosticDetail })
+              if (
+                shouldMarkAccountHealthyAfterWebview(
+                  resolvedProviderId,
+                  credentialFallbackAccounts.has(cand.id) ? 'expired' : cand.health_status,
+                  stage
+                ) &&
+                credentialHeal === null
+              ) {
+                credentialHeal = (credentialFallbackAccounts.has(cand.id)
+                  ? capturePersistedProviderCredentials(resolvedProviderId, cand.id).then((captured) =>
+                      providerSvc.refreshProviderKey(cand.owner_user_id, cand.id, {
+                        encryptedKey: captured.encryptedKey,
+                        expiresAt: captured.expiresAt,
+                        healthStatus: 'healthy'
+                      })
+                    )
+                  : providerSvc.updateHealth(cand.owner_user_id, cand.id, 'healthy'))
+                  .then(() => {
+                    cand.health_status = 'healthy'
+                    invalidateKeysByKeyId(cand.id)
+                    logGeneration('account-credential-healed', {
+                      jobId: job.id,
+                      accountId: cand.id,
+                      providerId: resolvedProviderId,
+                      rebuiltCredential: credentialFallbackAccounts.has(cand.id)
+                    })
+                  })
+              }
               emit({ jobId: job.id, status: 'running', stage, message: stage, data: detail })
             }
           })
+          if (credentialHeal) {
+            try {
+              await credentialHeal
+            } catch (e) {
+              logGeneration('account-health-update-failed', { jobId: job.id, accountId: cand.id, error: e })
+            }
+          }
         }
         logGeneration('account-attempt-result', {
           jobId: job.id,
@@ -743,7 +784,7 @@ export async function runGenerate(
           })
           if (retryDecision.expireAccount) {
             try {
-              await providerSvc.updateHealth(input.userId, cand.id, 'expired')
+              await providerSvc.updateHealth(cand.owner_user_id, cand.id, 'expired')
               // 健康态变了会直接影响后续生成的选号排序，立即失效该 key 所在分区缓存
               invalidateKeysByKeyId(cand.id)
             } catch (e) {

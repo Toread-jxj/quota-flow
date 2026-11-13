@@ -5,6 +5,24 @@ export type AccountRetryDecision = {
 }
 
 /**
+ * 豆包的账号级持久化分区可能仍保有有效登录态，因此数据库密文在当前机器无法解密时，
+ * 应交给 WebView 做实际登录态判断；其他厂商保持原有凭据失败处理。
+ */
+export function shouldUsePersistedPartitionAfterCredentialFailure(providerId: string): boolean {
+  return providerId === 'doubao'
+}
+
+/** 豆包的旧健康标记不能替代当前持久化分区的实际登录态验证。 */
+export function shouldBlockPreferredAccountBeforeWebview(providerId: string, healthStatus: string): boolean {
+  return providerId !== 'doubao' && healthStatus === 'expired'
+}
+
+/** `wait-tab` 仅在豆包页面检查确认未出现登录墙后触发，可作为当前分区已登录的证据。 */
+export function shouldMarkAccountHealthyAfterWebview(providerId: string, healthStatus: string, stage: string): boolean {
+  return providerId === 'doubao' && healthStatus === 'expired' && stage === 'wait-tab'
+}
+
+/**
  * 仅明确的账号级故障允许自动换号。
  * DOM、上传、提交、风控、等待和结果提取失败均属于当前页面/任务故障，换号无助且会破坏现场。
  * 豆包规则不应改变其他厂商的既有调度语义。

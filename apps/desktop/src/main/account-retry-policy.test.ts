@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { decideAccountRetry } from './account-retry-policy'
+import {
+  decideAccountRetry,
+  shouldBlockPreferredAccountBeforeWebview,
+  shouldMarkAccountHealthyAfterWebview,
+  shouldUsePersistedPartitionAfterCredentialFailure
+} from './account-retry-policy'
 
 describe('decideAccountRetry', () => {
   it('图片上传检测失败时停止并保留当前账号，不切换账号', () => {
@@ -37,6 +42,24 @@ describe('decideAccountRetry', () => {
   it('手工指定账号失败时永不换号', () => {
     expect(decideAccountRetry('豆包账号未登录（cookie 可能已失效）', true, 'doubao'))
       .toEqual({ retry: false, expireAccount: true, reason: 'preferred-account-locked' })
+  })
+
+  it('豆包数据库凭据解密失败时进入账号持久化分区验证，不提前封禁或换号', () => {
+    expect(shouldUsePersistedPartitionAfterCredentialFailure('doubao')).toBe(true)
+    expect(shouldUsePersistedPartitionAfterCredentialFailure('qwenwan')).toBe(false)
+  })
+
+  it('豆包手工指定账号的旧失效标记不应在 WebView 实际验证前拦截', () => {
+    expect(shouldBlockPreferredAccountBeforeWebview('doubao', 'expired')).toBe(false)
+    expect(shouldBlockPreferredAccountBeforeWebview('qwenwan', 'expired')).toBe(true)
+    expect(shouldBlockPreferredAccountBeforeWebview('doubao', 'healthy')).toBe(false)
+  })
+
+  it('豆包 WebView 确认已登录后可把旧失效标记恢复为健康', () => {
+    expect(shouldMarkAccountHealthyAfterWebview('doubao', 'expired', 'wait-tab')).toBe(true)
+    expect(shouldMarkAccountHealthyAfterWebview('doubao', 'expired', 'open-page')).toBe(false)
+    expect(shouldMarkAccountHealthyAfterWebview('qwenwan', 'expired', 'wait-tab')).toBe(false)
+    expect(shouldMarkAccountHealthyAfterWebview('doubao', 'healthy', 'wait-tab')).toBe(false)
   })
 
 })

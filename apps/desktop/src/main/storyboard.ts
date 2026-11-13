@@ -102,28 +102,34 @@ interface ParsedDial { role: string; shot: number; line: string }
  *       台词要么在后续弯引号「“…”」里（旧），要么在该行冒号后（新）。
  */
 function extractDialogues(body: string): ParsedDial[] {
-  const cLayer = body.match(/【[^】]*对白[^】]*】([\s\S]*?)(?=【)/)
+  const cLayer = body.match(/【[^】]*对白[^】]*】([\s\S]*?)(?=【|$)/)
   const text = cLayer ? cLayer[1] : ''
   const dials: ParsedDial[] = []
   const seen = new Set<string>()
+  const add = (role: string, line: string): void => {
+    const cleanLine = line.trim().replace(/^[“"]|[”"]$/g, '')
+    if (/^(NIGHT|DAWN|DAY|MORNING|AM|PM)$/i.test(role)) return
+    if (!cleanLine || seen.has(role + '|' + cleanLine)) return
+    seen.add(role + '|' + cleanLine)
+    dials.push({ role, shot: 0, line: cleanLine })
+  }
+
+  // 旧格式：｜ROLE｜：“台词”
   const roleRe = /｜([A-Za-z][A-Za-z0-9_-]*)｜/g
   let m
   while ((m = roleRe.exec(text)) !== null) {
-    const role = m[1]
-    if (/^(NIGHT|DAWN|DAY|MORNING|AM|PM)$/i.test(role)) continue
     const after = text.slice(m.index + m[0].length, m.index + m[0].length + 400)
-    let line = ''
     const q = after.match(/\u201c([^\u201d]+)\u201d/)
-    if (q) line = q[1].trim()
+    if (q) add(m[1], q[1])
     else {
       const c = after.match(/[：:]\s*([^\n]*)/)
-      if (c && /[A-Za-z]/.test(c[1])) line = c[1].trim()
-    }
-    if (line && !seen.has(role + '|' + line)) {
-      seen.add(role + '|' + line)
-      dials.push({ role, shot: 0, line })
+      if (c && /[A-Za-z]/.test(c[1])) add(m[1], c[1])
     }
   }
+
+  // 新格式：- D001｜0.04—2.84秒｜MAYA：台词
+  const timedRe = /^\s*-\s*[^｜|\n]+[｜|][^｜|\n]+[｜|]\s*([A-Za-z][A-Za-z0-9_-]*)[：:]\s*([^\n]+)$/gm
+  while ((m = timedRe.exec(text)) !== null) add(m[1], m[2])
   return dials
 }
 
@@ -151,7 +157,7 @@ function parseSegment(body: string): {
     const tm = heads[i].head.match(new RegExp(`([\\d.]+)${DASH}([\\d.]+)秒?`))
     const no = noM ? parseInt(noM[1], 10) : i + 1
     const dur = tm ? parseFloat(tm[2]) - parseFloat(tm[1]) : 5
-    const act = content.match(/动作[：:]\s*([\s\S]*?)(?=[。]?(?:表演触发|对白覆盖|对白对应|切点))/)
+    const act = content.match(/动作(?:链)?[：:]\s*([\s\S]*?)(?=\n\s*(?:#{1,6}\s*(?:【|$)|(?:#{1,6}\s*)?(?:表演触发|表演节拍|对白覆盖|对白对应|对白归属|切点|【))|$)/)
     shots.push({ no, dur, action: act ? act[1].trim().replace(/[。\s]+$/, '') : '' })
   }
 
@@ -181,16 +187,23 @@ function buildRawPrompt(body: string, refs: string[], refLabels: string[]): stri
 
 /** 解析段标题行：从「## V001｜字段1｜字段2」中识别时码（分:秒）与标题，不假设位置 */
 function parseHeading(line: string): { id: string; title: string; fromT: string; toT: string } | null {
-  const m = line.match(/^##\s*([A-Za-z]+\d+)[｜|]\s*(.+?)[｜|]\s*(.+?)\s*$/)
+  const m = line.match(/^##\s*([^｜|]+)[｜|]\s*(.+)$/)
   if (!m) return null
-  const f2 = m[2].trim()
-  const f3 = m[3].trim()
-  const timeRe = new RegExp(`^(\\d+:\\d+(?:\\.\\d+)?)${DASH}(\\d+:\\d+(?:\\.\\d+)?)$`)
-  const t2 = f2.match(timeRe)
-  const t3 = f3.replace(/^全片\s*/, '').match(timeRe)
-  if (t2) return { id: m[1], title: f3, fromT: t2[1], toT: t2[2] }
-  if (t3) return { id: m[1], title: f2, fromT: t3[1], toT: t3[2] }
-  return { id: m[1], title: f2, fromT: '0:0', toT: '0:15' }
+  const id = m[1].trim()
+  const fields = m[2].split(/[｜|]/).map((x) => x.trim()).filter(Boolean)
+  if (fields.length === 0) return null
+  const timeRe = new RegExp(`^(?:全片\\s*)?(\\d+:\\d+(?:\\.\\d+)?)${DASH}(\\d+:\\d+(?:\\.\\d+)?)$`)
+  const timeIndex = fields.findIndex((field) => timeRe.test(field))
+  if (timeIndex >= 0) {
+    const tm = fields[timeIndex].match(timeRe)
+    return {
+      id,
+      title: fields.find((field, index) => index !== timeIndex && !/^\\d+(?:\\.\\d+)?秒?$/.test(field)) || id,
+      fromT: tm?.[1] || '0:0',
+      toT: tm?.[2] || '0:15'
+    }
+  }
+  return { id, title: fields[0], fromT: '0:0', toT: '0:15' }
 }
 
 /** 从正文提取项目名（书名号《…》），用于无 ## 标题的单段分镜词 */
@@ -202,7 +215,7 @@ function extractTitle(body: string): string {
 /** 内容打分：判断 .md 文本是否像分镜词（靠结构特征，不靠文件名） */
 function storyboardScore(text: string): number {
   let score = 0
-  if (/^##\s*[A-Za-z]+\d+[｜|]/m.test(text)) score += 3 // 分段标题
+  if (/^##\s*(?:V\d+|E\d+-V\d+)[｜|]/m.test(text)) score += 3 // 分段标题（V001 / E01-V01）
   if (/【[^】]*镜头[^】]*】/.test(text)) score += 3 // 镜头栏目（核心特征）
   if ((text.match(/【[^】]+】/g) || []).length >= 3) score += 2 // 多个栏目
   if (/【[^】]*对白[^】]*】/.test(text)) score += 1 // 对白栏目
@@ -213,7 +226,7 @@ function storyboardScore(text: string): number {
 
 // ---- 主解析：文本 → 结构化 shots（默认 raw）----
 export function parseStoryboardText(text: string): StoryboardShot[] {
-  const segRe = /^##\s*([A-Za-z]+\d+)[｜|]/gm
+  const segRe = /^##\s*((?:V\d+|E\d+-V\d+))[｜|]/gm
   const starts: number[] = []
   let m
   while ((m = segRe.exec(text)) !== null) starts.push(m.index)

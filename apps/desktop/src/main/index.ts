@@ -713,7 +713,7 @@ app.whenReady().then(() => {
   })
 
   // ---- 分镜编排进度文件（storyboard-progress.json，记录每段 shot 的 jobId/remoteUrl/视频路径）----
-  const readStoryboardProgress = (workDir: string): Record<string, { jobId?: string; remoteUrl?: string; videoPath?: string; status?: string; accountId?: string | null }> => {
+  const readStoryboardProgress = (workDir: string): Record<string, { jobId?: string; remoteUrl?: string; videoPath?: string; status?: string; accountId?: string | null; submittedPendingRecovery?: boolean }> => {
     try {
       const normalPath = join(workDir, 'storyboard-progress.json')
       const legacyPath = join(workDir, '.storyboard-progress.json')
@@ -725,7 +725,7 @@ app.whenReady().then(() => {
       return {}
     }
   }
-  const writeStoryboardProgress = (workDir: string, index: number, entry: { jobId?: string | null; remoteUrl?: string | null; videoPath?: string; status?: string; accountId?: string | null }): { ok: boolean; error?: string } => {
+  const writeStoryboardProgress = (workDir: string, index: number, entry: { jobId?: string | null; remoteUrl?: string | null; videoPath?: string; status?: string; accountId?: string | null; submittedPendingRecovery?: boolean | null }): { ok: boolean; error?: string } => {
     try {
       const p = join(workDir, 'storyboard-progress.json')
       const legacyPath = join(workDir, '.storyboard-progress.json')
@@ -746,6 +746,7 @@ app.whenReady().then(() => {
       if (entry.jobId === null) delete next.jobId
       if (entry.remoteUrl === null) delete next.remoteUrl
       if (entry.accountId === null) delete next.accountId
+      if (entry.submittedPendingRecovery === null) delete next.submittedPendingRecovery
       if (entry.videoPath === undefined) delete next.videoPath
       raw.shots[String(index)] = next
       writeFileSync(p, JSON.stringify(raw, null, 2), 'utf8')
@@ -761,6 +762,7 @@ app.whenReady().then(() => {
       remoteUrl: null,
       videoPath: undefined,
       accountId: null,
+      submittedPendingRecovery: null,
       status: 'pending'
     })
   })
@@ -790,7 +792,7 @@ app.whenReady().then(() => {
       mkdirSync(shotsDir, { recursive: true })
       // 进度恢复：读进度文件 + 扫 shots 目录，关联已生成视频 / 记录 remoteUrl（供补回）
       const savedProgress = readStoryboardProgress(params.workDir)
-      const progress: Record<number, { jobId?: string; remoteUrl?: string; videoPath?: string; status?: string; accountId?: string | null }> = {}
+      const progress: Record<number, { jobId?: string; remoteUrl?: string; videoPath?: string; status?: string; accountId?: string | null; submittedPendingRecovery?: boolean }> = {}
       for (const shot of shots) {
         const idx = shot.index
         const saved = savedProgress[String(idx)] || {}
@@ -798,6 +800,9 @@ app.whenReady().then(() => {
         if (saved.status === 'pending') {
           // 新一轮生成已开始：旧文件仍保留，但不得在重启后冒充本轮已完成。
           progress[idx] = { ...saved, videoPath: undefined, status: 'pending' }
+        } else if (saved.status === 'submitted_pending_recovery' || saved.submittedPendingRecovery === true) {
+          // 已提交后关窗：豆包后台仍可能生成。重启后必须保留待找回状态，禁止误开放重生成。
+          progress[idx] = { ...saved, videoPath: undefined, status: 'submitted_pending_recovery', submittedPendingRecovery: true }
         } else if (existsSync(filePath)) {
           progress[idx] = { ...saved, videoPath: filePath, status: 'done' }
         } else if (saved.remoteUrl) {
@@ -825,9 +830,16 @@ app.whenReady().then(() => {
         const result = generationResult
         logGeneration('storyboard-generate-result', { index: params.index, ok: result.ok, jobId: result.jobId ?? null, error: result.error ?? null, accountId: result.accountId ?? null, hasRemoteUrl: !!result.remoteUrl })
         if (!result.ok || !result.jobId) {
-          const saved = writeStoryboardProgress(params.batchDir, params.index, { jobId: result.jobId || null, remoteUrl: result.remoteUrl || null, accountId: result.accountId || null, status: 'error' })
-          if (!saved.ok) return { ok: false, error: `生成失败且进度写入失败: ${saved.error || '未知错误'}`, jobId: result.jobId, remoteUrl: result.remoteUrl ?? null, accountId: result.accountId ?? null }
-          return { ok: false, error: result.error || '生成失败', jobId: result.jobId, remoteUrl: result.remoteUrl ?? null, accountId: result.accountId ?? null }
+          const submittedPendingRecovery = result.submittedPendingRecovery === true
+          const saved = writeStoryboardProgress(params.batchDir, params.index, {
+            jobId: result.jobId || null,
+            remoteUrl: result.remoteUrl || null,
+            accountId: result.accountId || null,
+            submittedPendingRecovery,
+            status: submittedPendingRecovery ? 'submitted_pending_recovery' : 'error'
+          })
+          if (!saved.ok) return { ok: false, error: `生成失败且进度写入失败: ${saved.error || '未知错误'}`, jobId: result.jobId, remoteUrl: result.remoteUrl ?? null, accountId: result.accountId ?? null, submittedPendingRecovery }
+          return { ok: false, error: result.error || '生成失败', jobId: result.jobId, remoteUrl: result.remoteUrl ?? null, accountId: result.accountId ?? null, submittedPendingRecovery }
         }
         let src = join(app.getPath('userData'), 'videos', `${result.jobId}.mp4`)
         if (!existsSync(src) && result.remoteUrl) {

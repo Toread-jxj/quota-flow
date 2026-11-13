@@ -9,6 +9,7 @@
 import { BrowserWindow, session } from 'electron'
 import { logGeneration } from './diagnostics'
 import {
+  classifyDoubaoUserClose,
   shouldAbortDoubaoUpload,
   shouldCloseDoubaoWindow,
   type DoubaoWindowTerminalReason
@@ -94,6 +95,8 @@ export interface DoubaoGenerateResult {
   blocked?: boolean
   /** 用户手动终止（提示词未发送） */
   cancelled?: boolean
+  /** 已提交到豆包服务端，但用户关闭窗口并结束本地监听；需要稍后人工找回视频。 */
+  submittedPendingRecovery?: boolean
   attempts: Array<{ providerId: string; ok: boolean; errorMessage?: string }>
 }
 
@@ -1397,9 +1400,15 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   const cancelState = options.cancel
   let userClosed = false
   let terminalCloseRequested = false
+  let submitAttempted = false
   const failUserClosed = (): DoubaoGenerateResult => {
-    attempts.push({ providerId: 'doubao', ok: false, errorMessage: '豆包窗口被用户关闭，生成未完成' })
-    return { ok: false, providerId: 'doubao', error: '豆包窗口被用户关闭，生成未完成', attempts }
+    const outcome = classifyDoubaoUserClose(cancelState?.submitted === true, submitAttempted)
+    const submittedPendingRecovery = outcome === 'submitted-pending-recovery'
+    const error = submittedPendingRecovery
+      ? '生成已提交，豆包窗口已关闭，请稍后打开原账号会话找回视频'
+      : '豆包窗口被用户关闭，资料未完成提交'
+    attempts.push({ providerId: 'doubao', ok: false, errorMessage: error })
+    return { ok: false, providerId: 'doubao', error, submittedPendingRecovery, attempts }
   }
   const failCancelled = (): DoubaoGenerateResult => {
     attempts.push({ providerId: 'doubao', ok: false, errorMessage: '已手动终止生成（提示词未发送）' })
@@ -1762,6 +1771,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
     }
     progress(options, 'submit-img2video')
     trace('submit-start', { mode: 'img2video' })
+    submitAttempted = true
     try {
       fillResult = (await win.webContents.executeJavaScript(
         '(' + insertPromptAndSubmitScript.toString() + ')(' + JSON.stringify(submitPrompt) + ')',
@@ -1772,6 +1782,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
     }
   } else {
     trace('submit-start', { mode: 'text2video' })
+    submitAttempted = true
     try {
       fillResult = (await win.webContents.executeJavaScript(
         '(' + fillAndSubmitScript.toString() + ')(' + JSON.stringify(submitPrompt) + ')',
@@ -1782,6 +1793,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
     }
   }
   trace('submit-result', fillResult)
+  if (userClosed) return failUserClosed()
   if (!fillResult.ok) {
     closeWindow('submit-failed', fillResult)
     return fail(fillResult.reason || '提交失败，窗口已保留供检查')

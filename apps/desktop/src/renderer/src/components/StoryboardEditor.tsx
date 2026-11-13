@@ -7,6 +7,7 @@ import Select from './Select'
 import { IconSparkles } from './icons'
 import { getInitialShowWebview } from './Modals'
 import { initializePromptDrafts, promptForGeneration, updatePromptDraft } from './storyboard-prompt-policy'
+import { buildStoryboardAccountOption } from './storyboard-account-policy'
 
 interface StoryboardEditorProps {
   user: AuthUser
@@ -371,11 +372,7 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
           onChange={setPreferredAccountId}
           options={[
             { value: '', label: '账号：自动' },
-            ...doubaoKeys.map((k) => ({
-              value: k.keyId,
-              label: `${k.accountName}（剩 ${k.remaining}秒）${k.health === 'expired' ? '｜已失效' : k.health === 'expiring' ? '｜即将过期' : ''}`,
-              disabled: k.health === 'expired'
-            }))
+            ...doubaoKeys.map(buildStoryboardAccountOption)
           ]}
           style={{ minWidth: 210 }}
         />

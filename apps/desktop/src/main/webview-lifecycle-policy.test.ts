@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { shouldCloseDoubaoWindow } from './webview-lifecycle-policy'
+import { shouldAbortDoubaoUpload, shouldCloseDoubaoWindow } from './webview-lifecycle-policy'
+
+describe('shouldAbortDoubaoUpload', () => {
+  it('用户关闭窗口或点击停止时立即结束上传等待', () => {
+    expect(shouldAbortDoubaoUpload(false, false)).toBe(false)
+    expect(shouldAbortDoubaoUpload(true, false)).toBe(true)
+    expect(shouldAbortDoubaoUpload(false, true)).toBe(true)
+  })
+})
 
 describe('shouldCloseDoubaoWindow', () => {
   it('上传检测和提交失败时保留窗口供人工检查', () => {

@@ -8,7 +8,11 @@
 
 import { BrowserWindow, session } from 'electron'
 import { logGeneration } from './diagnostics'
-import { shouldCloseDoubaoWindow, type DoubaoWindowTerminalReason } from './webview-lifecycle-policy'
+import {
+  shouldAbortDoubaoUpload,
+  shouldCloseDoubaoWindow,
+  type DoubaoWindowTerminalReason
+} from './webview-lifecycle-policy'
 import { pickNewVideoResult } from './video-result-policy'
 import { hasConfirmRequestAfterPrompt } from './confirm-request-policy'
 import { readFileSync } from 'node:fs'
@@ -1724,27 +1728,30 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
         '(' + uploadImagesScript.toString() + ')(' + JSON.stringify(dataUrls) + ')',
         true
       )
-      const cancelPromise = cancelState
-        ? (async () => {
-            while (!uploadSettled) {
-              if (cancelState.aborted) {
-                try {
-                  await win.webContents.executeJavaScript('window.__qfUploadCancel = true', true)
-                } catch {}
-                return { cancelled: true }
-              }
-              await sleep(200)
+      const abortUploadPromise = (async () => {
+        while (!uploadSettled) {
+          if (shouldAbortDoubaoUpload(cancelState?.aborted === true, userClosed)) {
+            if (!userClosed) {
+              try {
+                await win.webContents.executeJavaScript('window.__qfUploadCancel = true', true)
+              } catch {}
             }
-            return null
-          })()
-        : new Promise<unknown>(() => {})
-      uploadDetail = await Promise.race([uploadPromise, cancelPromise])
+            return { cancelled: cancelState?.aborted === true, userClosed }
+          }
+          await sleep(200)
+        }
+        return null
+      })()
+      uploadDetail = await Promise.race([uploadPromise, abortUploadPromise])
       uploadSettled = true
       uploadCancelled = !!(uploadDetail as { cancelled?: boolean })?.cancelled
       uploadOk = !!((uploadDetail as { ok?: boolean })?.ok)
     } catch {}
     progress(options, 'upload-images-result', uploadDetail)
     trace('upload-result', uploadDetail)
+    if (userClosed || !!(uploadDetail as { userClosed?: boolean })?.userClosed) {
+      return failUserClosed()
+    }
     if (uploadCancelled) {
       closeWindow('cancelled', uploadDetail)
       return abortNow()

@@ -6,6 +6,7 @@ import type { ProvidersResult } from '../hooks/useProviders'
 import Select from './Select'
 import { IconSparkles } from './icons'
 import { getInitialShowWebview } from './Modals'
+import { initializePromptDrafts, promptForGeneration, updatePromptDraft } from './storyboard-prompt-policy'
 
 interface StoryboardEditorProps {
   user: AuthUser
@@ -60,6 +61,7 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
   const [manualUrlValue, setManualUrlValue] = useState('')
   const [videoPickerFor, setVideoPickerFor] = useState<number | null>(null)
   const [videoPickerList, setVideoPickerList] = useState<Array<{ src: string; poster?: string }>>([])
+  const [promptDrafts, setPromptDrafts] = useState<Record<number, string>>({})
 
   const doubaoKeys = useMemo(() => providers.aggs.find((a) => a.providerId === 'doubao')?.bindings ?? [], [providers.aggs])
 
@@ -70,6 +72,7 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
       setResult(null)
       setVideos({})
       setStatusMap({})
+      setPromptDrafts({})
       setFinalVideo(null)
     }
   }, [])
@@ -79,6 +82,7 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
     const r = await window.api.storyboard.parse({ workDir })
     if (r.ok && r.result) {
       setResult(r.result)
+      setPromptDrafts(initializePromptDrafts(r.result.shots))
       const m: Record<number, ShotStatus> = {}
       const v: Record<number, string> = {}
       const ri: Record<number, { jobId: string; remoteUrl: string }> = {}
@@ -138,7 +142,8 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
       try {
         const begun = await window.api.storyboard.beginGenerate({ batchDir: result.batchDir, index: shot.index })
         if (!begun.ok) throw new Error(begun.error || '无法清理上一轮分镜进度')
-        const gen = await buildGen(user, shot, preferredAccountId || null, { autoConfirm: isBatch })
+        const currentShot = { ...shot, prompt: promptForGeneration(shot, promptDrafts) }
+        const gen = await buildGen(user, currentShot, preferredAccountId || null, { autoConfirm: isBatch })
         if (!gen) {
           const failed = await window.api.storyboard.markError({ batchDir: result.batchDir, index: shot.index })
           onToast?.(failed.ok ? '未获取到登录态' : `未获取到登录态；进度写入失败：${failed.error || '未知错误'}`)
@@ -172,7 +177,7 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
         setActiveShotIndex(null)
       }
     },
-    [result, user, onToast, preferredAccountId, activeShotIndex]
+    [result, user, onToast, preferredAccountId, activeShotIndex, promptDrafts]
   )
 
   const retryDownload = useCallback(
@@ -182,11 +187,20 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
       if (!info) return
       setStatusMap((m) => ({ ...m, [shot.index]: 'running' as ShotStatus }))
       try {
+        const cfg = getSupabaseConfig()
+        const auth = getAuthService()
+        const session = await auth?.getSession()
+        if (!cfg || !session?.access_token) throw new Error('登录状态异常，无法补下载并结算额度')
         const r = await window.api.storyboard.reDownload({
           remoteUrl: info.remoteUrl,
           jobId: info.jobId,
           batchDir: result.batchDir,
-          index: shot.index
+          index: shot.index,
+          supabaseUrl: cfg.url,
+          supabaseAnonKey: cfg.anonKey,
+          accessToken: session.access_token,
+          refreshToken: session.refresh_token,
+          userId: user.id
         })
         if (r.ok && r.videoPath) {
           setVideos((v) => ({ ...v, [shot.index]: r.videoPath! }))
@@ -205,7 +219,7 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
         setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
       }
     },
-    [result, retryInfo, onToast]
+    [result, retryInfo, onToast, user]
   )
 
   const openDoubao = useCallback(
@@ -519,9 +533,14 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
                   </div>
                 )}
 
-                <details className="shot-prompt">
-                  <summary>提示词（raw 照抄）</summary>
-                  <pre>{shot.prompt}</pre>
+                <details className="shot-prompt" open>
+                  <summary>提示词（客户端可修改，不改来源文档）</summary>
+                  <textarea
+                    value={promptForGeneration(shot, promptDrafts)}
+                    onChange={(e) => setPromptDrafts((drafts) => updatePromptDraft(drafts, shot.index, e.target.value))}
+                    disabled={st === 'running'}
+                    aria-label={`分镜 ${shot.index} 提示词`}
+                  />
                 </details>
 
                 {shot.dialogue.length > 0 && (

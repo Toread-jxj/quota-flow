@@ -1155,6 +1155,37 @@ export class JobService {
     return (data ?? null) as unknown as JobListItem | null
   }
 
+  /** 补下载结算只读取额度追记所需的最小字段，避免拉取完整 options/attempts。 */
+  async getJobQuotaRecovery(userId: string, jobId: string): Promise<{
+    id: string
+    team_id: string | null
+    provider_id: string | null
+    account_id: string | null
+    cost_amount: number | null
+    created_at: string
+    quotaDate: string | null
+    optionAccountId: string | null
+  } | null> {
+    const { data, error } = await this.client
+      .from('jobs')
+      .select('id, team_id, provider_id, account_id, cost_amount, created_at, quotaDate:options->quotaDate, optionAccountId:options->accountId')
+      .eq('id', jobId)
+      .eq('user_id', userId)
+      .maybeSingle()
+    if (error) throw error
+    if (!data) return null
+    return {
+      id: data.id as string,
+      team_id: (data.team_id as string | null) ?? null,
+      provider_id: (data.provider_id as string | null) ?? null,
+      account_id: (data.account_id as string | null) ?? null,
+      cost_amount: data.cost_amount == null ? null : Number(data.cost_amount),
+      created_at: data.created_at as string,
+      quotaDate: typeof data.quotaDate === 'string' ? data.quotaDate : null,
+      optionAccountId: typeof data.optionAccountId === 'string' ? data.optionAccountId : null
+    }
+  }
+
   /** 详情/去水印/重试等需要完整 options、attempts、cost_breakdown 的路径使用。 */
   async getJob(userId: string, jobId: string): Promise<JobRow | null> {
     const { data, error } = await this.client

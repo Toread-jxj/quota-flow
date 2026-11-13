@@ -4792,15 +4792,18 @@ textarea::-webkit-scrollbar {
   cursor: pointer;
   color: var(--fg-muted);
 }
-.shot-prompt pre {
+.shot-prompt textarea {
+  width: 100%;
+  min-height: 140px;
   margin-top: 6px;
   padding: 8px;
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--bg-elevated);
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-size: 0.85em;
   color: var(--fg-primary);
+  font: inherit;
+  line-height: 1.5;
+  resize: vertical;
 }
 
 .shot-dialogue {

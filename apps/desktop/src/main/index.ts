@@ -28,6 +28,7 @@ import { uploadImage as uploadImageToGh, cleanupOldImages } from './github-uploa
 import { clearKeysCache, handleKeysCacheInvalidate } from './query-cache'
 import { generationLogPath, logGeneration } from './diagnostics'
 import { validateStoryboardProgressRoot } from './storyboard-progress-policy'
+import { buildStoryboardRecoveryQuotaRequest, quotaDateForJob } from './storyboard-recovery-policy'
 
 /** 活跃生成任务注册表：jobId → 取消/已提交状态（用于「终止生成」与「关闭确认」） */
 interface ActiveRunState {
@@ -874,18 +875,56 @@ app.whenReady().then(() => {
     }
   })
 
-  ipcMain.handle('storyboard:re-download', async (_e, params: { remoteUrl: string; jobId: string; batchDir: string; index: number }) => {
+  ipcMain.handle('storyboard:re-download', async (_e, params: {
+    remoteUrl: string
+    jobId: string
+    batchDir: string
+    index: number
+    supabaseUrl: string
+    supabaseAnonKey: string
+    accessToken: string
+    refreshToken: string
+    userId: string
+  }) => {
     try {
       if (!params.remoteUrl) return { ok: false, error: '缺少远程视频 URL' }
+      const client = createSupabaseClient({ supabaseUrl: params.supabaseUrl, supabaseAnonKey: params.supabaseAnonKey })
+      await client.auth.setSession({ access_token: params.accessToken, refresh_token: params.refreshToken })
+      const jobSvc = new JobService(client)
+      const job = await jobSvc.getJobQuotaRecovery(params.userId, params.jobId)
+      if (!job || job.provider_id !== 'doubao' || Number(job.cost_amount ?? 0) <= 0) {
+        return { ok: false, error: '补下载任务缺少有效额度信息' }
+      }
+
       let dlError = ''
       const downloaded = await downloadVideo(params.remoteUrl, params.jobId, 'doubao', 0, (reason) => { dlError = reason })
       if (!downloaded) return { ok: false, error: dlError || '补下载失败' }
+
+      const keyId = job.account_id ?? job.optionAccountId
+      const quotaDate = job.quotaDate ?? quotaDateForJob(job.created_at)
+      const quotaRequest = buildStoryboardRecoveryQuotaRequest({
+        jobId: job.id,
+        userId: params.userId,
+        providerId: job.provider_id,
+        costAmount: Number(job.cost_amount),
+        keyId,
+        teamId: job.team_id,
+        date: quotaDate
+      })
+      const { data: quotaData, error: quotaError } = await client.rpc(quotaRequest.rpcName, quotaRequest.rpcArgs)
+      if (quotaError) return { ok: false, error: `视频已补下载但额度结算失败: ${quotaError.message}` }
+      const quotaResult = quotaData as unknown as { ok?: boolean; code?: string; message?: string; row?: QuotaUpdatedPayload['ledger'] }
+      if (!quotaResult?.ok) {
+        return { ok: false, error: `视频已补下载但额度结算失败: ${quotaResult?.message || quotaResult?.code || '未知错误'}` }
+      }
+
       const shotsDir = join(params.batchDir, 'shots')
       mkdirSync(shotsDir, { recursive: true })
       const dst = join(shotsDir, shotFileName(params.index))
       copyFileSync(downloaded, dst)
       const saved = writeStoryboardProgress(params.batchDir, params.index, { jobId: params.jobId, remoteUrl: params.remoteUrl, videoPath: dst, status: 'done' })
-      if (!saved.ok) return { ok: false, error: `视频已补下载但进度写入失败: ${saved.error || '未知错误'}` }
+      if (!saved.ok) return { ok: false, error: `视频已补下载并结算额度，但进度写入失败: ${saved.error || '未知错误'}` }
+      if (quotaResult.row) sendQuotaUpdated({ userId: params.userId, ledger: quotaResult.row })
       return { ok: true, videoPath: dst }
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) }

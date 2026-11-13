@@ -520,7 +520,7 @@ export interface DesktopApi {
     markError: (params: { batchDir: string; index: number }) => Promise<{ ok: boolean; error?: string }>
     generate: (params: { gen: GenerateRequest; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; jobId?: string; remoteUrl?: string | null; accountId?: string | null; error?: string }>
     merge: (params: { batchDir: string }) => Promise<{ ok: boolean; output?: string; error?: string }>
-    reDownload: (params: { remoteUrl: string; jobId: string; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
+    reDownload: (params: { remoteUrl: string; jobId: string; batchDir: string; index: number; supabaseUrl: string; supabaseAnonKey: string; accessToken: string; refreshToken: string; userId: string }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
     openDoubaoPage: (params: { keyId?: string }) => Promise<{ ok: boolean; error?: string }>
     downloadLatest: (params: { keyId?: string; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
     listVideos: (params: { keyId?: string }) => Promise<{ ok: boolean; videos?: Array<{ src: string; poster?: string }>; error?: string }>

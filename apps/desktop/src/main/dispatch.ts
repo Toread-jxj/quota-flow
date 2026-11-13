@@ -427,6 +427,7 @@ export async function runGenerate(
   const costInfo = providerCost(resolvedProviderId, input.durationSec, input.resolution)
   const cost = costInfo.amount
   const costUnit = costInfo.unitName
+  const quotaDate = todayKey()
   const images = (input.images ?? [])
     .filter((p) => typeof p === 'string' && /\.(jpe?g|png|webp|gif)$/i.test(p))
     .slice(0, resolvedProviderId === 'doubao' || resolvedProviderId === 'yuanbao' || resolvedProviderId === 'dola' ? 10 : 5)
@@ -438,7 +439,8 @@ export async function runGenerate(
     durationSec: input.durationSec,
     ratio: input.ratio,
     audio: input.audio,
-    resolution: input.resolution
+    resolution: input.resolution,
+    quotaDate
   }
   if (jobImages.length > 0) jobOptions.images = jobImages
   // 按厂商把密钥过滤下推到 SQL，只回传目标厂商行，避免每次生成整表拉取 encrypted_key 大字段
@@ -836,18 +838,20 @@ export async function runGenerate(
       }
       consumed = teamResult.row ?? null
     } else {
-      consumed = input.preferredAccountId
-        ? await providerSvc.consumeLedgerManual(input.userId, resolvedProviderId, cost, {
-            unitName: costUnit,
-            keyId: selectedKey?.id ?? undefined
-          })
-        : await providerSvc.consumeLedger(input.userId, resolvedProviderId, cost, {
-            unitName: costUnit,
-            keyId: selectedKey?.id ?? undefined
-          })
-      if (selectedKey?.id && consumed) {
-        await providerSvc.insertQuotaOperation(job.id, consumed.id, 'finalize', cost)
+      const { data, error } = await client.rpc('reconcile_consume_and_finalize', {
+        p_user_id: input.userId,
+        p_provider_id: resolvedProviderId,
+        p_amount: cost,
+        p_key_id: selectedKey?.id ?? null,
+        p_date: quotaDate,
+        p_job_id: job.id
+      })
+      if (error) throw error
+      const result = data as unknown as { ok?: boolean; code?: string; message?: string; row?: QuotaLedgerRow }
+      if (!result?.ok) {
+        throw new Error(`[${result?.code || 'UNKNOWN'}] ${result?.message || '额度扣减失败'}`)
       }
+      consumed = result.row ?? null
     }
     if (consumed) onQuotaUpdated?.({ userId: input.userId, ledger: consumed })
   } catch (e) {
@@ -855,6 +859,7 @@ export async function runGenerate(
     try {
       await jobSvc.updateJob(input.userId, job.id, {
         status: 'failed',
+        accountId: selectedKey?.id ?? null,
         error: quotaErr,
         resultUrl,
         costUnit,

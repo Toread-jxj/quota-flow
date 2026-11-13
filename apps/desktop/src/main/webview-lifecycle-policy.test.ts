@@ -1,17 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import {
-  classifyDoubaoUserClose,
-  shouldAbortDoubaoUpload,
-  shouldCloseDoubaoWindow
-} from './webview-lifecycle-policy'
-
-describe('classifyDoubaoUserClose', () => {
-  it('提交前关闭判定为未完成，提交后关闭判定为待找回', () => {
-    expect(classifyDoubaoUserClose(false, false)).toBe('cancelled-before-submit')
-    expect(classifyDoubaoUserClose(true, false)).toBe('submitted-pending-recovery')
-    expect(classifyDoubaoUserClose(false, true)).toBe('submitted-pending-recovery')
-  })
-})
+import { shouldAbortDoubaoUpload, shouldCloseDoubaoWindow } from './webview-lifecycle-policy'
 
 describe('shouldAbortDoubaoUpload', () => {
   it('用户关闭窗口或点击停止时立即结束上传等待', () => {

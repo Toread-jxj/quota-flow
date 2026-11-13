@@ -366,14 +366,7 @@ export async function runGenerate(
   emit: (event: DispatchEvent) => void,
   onJobCreated?: (jobId: string, state: { aborted: boolean; submitted: boolean }) => void,
   onQuotaUpdated?: (payload: QuotaUpdatedPayload) => void
-): Promise<{
-  ok: boolean
-  jobId?: string
-  error?: string
-  remoteUrl?: string | null
-  accountId?: string | null
-  submittedPendingRecovery?: boolean
-}> {
+): Promise<{ ok: boolean; jobId?: string; error?: string; remoteUrl?: string | null; accountId?: string | null }> {
   logGeneration('run-start', { providerId: input.providerId, durationSec: input.durationSec, mode: input.mode, preferredAccountId: input.preferredAccountId ?? null })
   if (!input.supabaseUrl || !input.supabaseAnonKey) {
     return { ok: false, error: 'Supabase 未配置' }
@@ -722,39 +715,20 @@ export async function runGenerate(
             }
           }
         }
-        const submittedPendingRecovery =
-          'submittedPendingRecovery' in result && result.submittedPendingRecovery === true
         logGeneration('account-attempt-result', {
           jobId: job.id,
           accountId: cand.id,
           ok: result.ok,
           hasVideoUrl: !!result.videoUrl,
           cancelled: !!result.cancelled,
-          submittedPendingRecovery,
           blocked: !!result.blocked,
-          errorCode: result.cancelled
-            ? 'USER_CANCELLED'
-            : submittedPendingRecovery
-              ? 'SUBMITTED_PENDING_RECOVERY'
-              : result.blocked
-                ? 'CONTENT_BLOCKED'
-                : result.ok
-                  ? null
-                  : 'GENERATION_FAILED'
+          errorCode: result.cancelled ? 'USER_CANCELLED' : result.blocked ? 'CONTENT_BLOCKED' : result.ok ? null : 'GENERATION_FAILED'
         })
         if (result.ok && result.videoUrl) {
           logGeneration('account-attempt-stop', { jobId: job.id, accountId: cand.id, reason: 'video-url-received' })
           break
         }
         lastError = result.error || '生成失败'
-        if (submittedPendingRecovery) {
-          logGeneration('account-attempt-stop', {
-            jobId: job.id,
-            accountId: cand.id,
-            reason: 'submitted-pending-recovery'
-          })
-          break
-        }
         // 用户手动终止（提示词未发送）：标记为失败，不再换号
         if (result.cancelled) {
           logGeneration('account-retry-decision', {
@@ -851,39 +825,20 @@ export async function runGenerate(
 
   if (!result || !result.ok || !result.videoUrl) {
     const err = result ? result.error || lastError || '生成失败' : lastError || `未找到可用${providerLabel(resolvedProviderId)}账号`
-    const submittedPendingRecovery =
-      !!result && 'submittedPendingRecovery' in result && result.submittedPendingRecovery === true
     try {
       await jobSvc.updateJob(input.userId, job.id, {
         status: 'failed',
         error: err,
         attempts: result?.attempts ?? [],
-        options: { ...jobOptions, submittedPendingRecovery },
+        options: jobOptions,
         completedAt: new Date().toISOString()
       })
     } catch (e) {
       logGeneration('job-status-update-failed', { jobId: job.id, targetStatus: 'failed', error: e })
     }
-    logGeneration('run-result', {
-      jobId: job.id,
-      ok: false,
-      accountId: selectedKey?.id ?? null,
-      errorCode: submittedPendingRecovery
-        ? 'SUBMITTED_PENDING_RECOVERY'
-        : result?.blocked
-          ? 'CONTENT_BLOCKED'
-          : result?.cancelled
-            ? 'USER_CANCELLED'
-            : 'GENERATION_FAILED'
-    })
+    logGeneration('run-result', { jobId: job.id, ok: false, accountId: selectedKey?.id ?? null, errorCode: result?.blocked ? 'CONTENT_BLOCKED' : result?.cancelled ? 'USER_CANCELLED' : 'GENERATION_FAILED' })
     emit({ jobId: job.id, status: 'failed', message: err })
-    return {
-      ok: false,
-      jobId: job.id,
-      error: err,
-      accountId: selectedKey?.id ?? null,
-      submittedPendingRecovery
-    }
+    return { ok: false, jobId: job.id, error: err, accountId: selectedKey?.id ?? null }
   }
 
   // 2) 成功：下载落盘 → 先扣额度 → 再写 job success

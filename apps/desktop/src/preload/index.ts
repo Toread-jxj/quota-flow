@@ -254,7 +254,7 @@ export interface StoryboardParseResult {
   batchDir: string
   shotsDir: string
   shots: StoryboardShot[]
-  progress?: Record<number, { jobId?: string; remoteUrl?: string; videoPath?: string; status?: string; accountId?: string | null; submittedPendingRecovery?: boolean }>
+  progress?: Record<number, { jobId?: string; remoteUrl?: string; videoPath?: string; status?: string; accountId?: string | null }>
 }
 
 export interface DesktopApi {
@@ -518,7 +518,7 @@ export interface DesktopApi {
     parse: (params: { textPath?: string; workDir: string }) => Promise<{ ok: boolean; result?: StoryboardParseResult; error?: string }>
     beginGenerate: (params: { batchDir: string; index: number }) => Promise<{ ok: boolean; error?: string }>
     markError: (params: { batchDir: string; index: number }) => Promise<{ ok: boolean; error?: string }>
-    generate: (params: { gen: GenerateRequest; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; jobId?: string; remoteUrl?: string | null; accountId?: string | null; submittedPendingRecovery?: boolean; error?: string }>
+    generate: (params: { gen: GenerateRequest; batchDir: string; index: number }) => Promise<{ ok: boolean; videoPath?: string; jobId?: string; remoteUrl?: string | null; accountId?: string | null; error?: string }>
     merge: (params: { batchDir: string }) => Promise<{ ok: boolean; output?: string; error?: string }>
     reDownload: (params: { remoteUrl: string; jobId: string; batchDir: string; index: number; supabaseUrl: string; supabaseAnonKey: string; accessToken: string; refreshToken: string; userId: string }) => Promise<{ ok: boolean; videoPath?: string; error?: string }>
     openDoubaoPage: (params: { keyId?: string }) => Promise<{ ok: boolean; error?: string }>

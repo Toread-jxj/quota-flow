@@ -15,7 +15,7 @@ interface StoryboardEditorProps {
   onToast?: (msg: string) => void
 }
 
-type ShotStatus = 'pending' | 'running' | 'done' | 'error' | 'submitted_pending_recovery'
+type ShotStatus = 'pending' | 'running' | 'done' | 'error'
 const BATCH_GENERATION_ENABLED = false
 
 /** 组装 runGenerate 需要的输入（复用桌面端登录态 + Supabase 上下文） */
@@ -104,9 +104,7 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
           if (p.accountId) {
             oi[idx] = p.accountId
           }
-          m[idx] = p.submittedPendingRecovery || p.status === 'submitted_pending_recovery'
-            ? 'submitted_pending_recovery'
-            : 'error'
+          m[idx] = 'error'
         }
       })
       setVideos(v)
@@ -166,13 +164,8 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
             setRetryInfo((m) => ({ ...m, [shot.index]: { jobId: r.jobId!, remoteUrl: r.remoteUrl! } }))
           }
           if (r.accountId) setOpenInfo((m) => ({ ...m, [shot.index]: r.accountId! }))
-          if (r.submittedPendingRecovery) {
-            onToast?.(`分镜 ${shot.index} 已提交，窗口已关闭；可继续下一段，稍后打开原账号会话找回视频`)
-            setStatusMap((m) => ({ ...m, [shot.index]: 'submitted_pending_recovery' as ShotStatus }))
-          } else {
-            onToast?.(`分镜 ${shot.index} 失败：${r.error || '未知'}`)
-            setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
-          }
+          onToast?.(`分镜 ${shot.index} 失败：${r.error || '未知'}`)
+          setStatusMap((m) => ({ ...m, [shot.index]: 'error' as ShotStatus }))
         }
       } catch (e) {
         const error = e instanceof Error ? e.message : String(e)
@@ -435,7 +428,7 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
                       setConfirmRegen(null)
                       void generateOne(shot)
                     }}
-                    disabled={st === 'running' || st === 'submitted_pending_recovery' || generating || activeShotIndex !== null}
+                    disabled={st === 'running' || generating || activeShotIndex !== null}
                   >
                     {st === 'done'
                       ? confirmRegen === shot.index
@@ -443,39 +436,29 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
                         : '✓ 重生成'
                       : st === 'running'
                         ? '生成中…'
-                        : st === 'submitted_pending_recovery'
-                          ? '已提交待找回'
-                          : st === 'error'
-                            ? '重新同步并生成'
-                            : '生成'}
+                        : st === 'error'
+                          ? '重新同步并生成'
+                          : '生成'}
                   </button>
                   <span className={`shot-status status-${st}`}>
-                    {st === 'done'
-                      ? '✓'
-                      : st === 'running'
-                        ? '…'
-                        : st === 'submitted_pending_recovery'
-                          ? '待找回'
-                          : st === 'error'
-                            ? '✗'
-                            : '待'}
+                    {st === 'done' ? '✓' : st === 'running' ? '…' : st === 'error' ? '✗' : '待'}
                   </span>
                   {st === 'error' && retryInfo[shot.index] && (
                     <button className="btn btn-sm" onClick={() => void retryDownload(shot)} disabled={generating}>
                       补下载
                     </button>
                   )}
-                  {(st === 'error' || st === 'submitted_pending_recovery') && openInfo[shot.index] && (
+                  {st === 'error' && openInfo[shot.index] && (
                     <button className="btn btn-sm" onClick={() => void openDoubao(shot)} disabled={generating}>
                       打开豆包
                     </button>
                   )}
-                  {(st === 'error' || st === 'submitted_pending_recovery') && openedPage === shot.index && (
+                  {st === 'error' && openedPage === shot.index && (
                     <button className="btn btn-sm" onClick={() => void downloadLatest(shot)} disabled={generating}>
                       下载最新
                     </button>
                   )}
-                  {(st === 'error' || st === 'submitted_pending_recovery') && openedPage === shot.index && (
+                  {st === 'error' && openedPage === shot.index && (
                     <button className="btn btn-sm" onClick={() => void pickVideo(shot)} disabled={generating}>
                       选视频
                     </button>
@@ -549,7 +532,7 @@ export default function StoryboardEditor({ user, providers, onToast }: Storyboar
                   </div>
                 )}
 
-                <details className="shot-prompt" open>
+                <details className="shot-prompt">
                   <summary>提示词（客户端可修改，不改来源文档）</summary>
                   <textarea
                     value={promptForGeneration(shot, promptDrafts)}

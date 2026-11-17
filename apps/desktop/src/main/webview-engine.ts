@@ -15,6 +15,8 @@ import {
   type DoubaoWindowTerminalReason
 } from './webview-lifecycle-policy'
 import { pickNewVideoResult } from './video-result-policy'
+import { findNewDoubaoFailureSignal, hasNewDoubaoFailureCount, shouldStartDoubaoManagedWindow } from './doubao-page-failure-policy'
+import { summarizeDoubaoNetworkFailures, type DoubaoNetworkFailure } from './doubao-network-diagnostics'
 import { hasConfirmRequestAfterPrompt } from './confirm-request-policy'
 import { readFileSync } from 'node:fs'
 
@@ -25,6 +27,8 @@ declare global {
     __qfFetchHooked?: boolean
     __qfXhrHooked?: boolean
     __qfUploadCancel?: boolean
+    __qfNetworkEpochs?: { upload: number; submit: number }
+    __qfNetworkObservations?: Array<{ kind: 'upload' | 'submit'; epoch: number; status?: number | null; transportError?: boolean }>
   }
 }
 
@@ -173,7 +177,12 @@ const openVideoTabScript = (): unknown => {
 }
 
 // 上传图片（图生视频）：找到上传 input，注入 File 并触发 change，等待上传完成
-const uploadImagesScript = (dataUrls: string[]): unknown => {
+const uploadImagesScript = (
+  dataUrls: string[],
+  uploadFailureBaselineReady = false,
+  baselineUploadFailureCount = 0,
+  uploadNetworkEpoch = 0
+): unknown => {
   const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
   const findInput = (): HTMLInputElement | null => {
     const inputs = [...document.querySelectorAll<HTMLInputElement>('input[type="file"]')]
@@ -229,6 +238,47 @@ const uploadImagesScript = (dataUrls: string[]): unknown => {
         return { ok: false, cancelled: true, reason: '已手动终止生成（提示词未发送）' }
       }
       const text = document.body ? document.body.innerText : ''
+      const visibleUploadRetries = [...document.querySelectorAll<HTMLElement>('button, [role="button"], [aria-label], [title]')]
+        .filter((el) => el.offsetParent !== null)
+        .filter((el) => /重新上传|上传失败.{0,20}(重试|重新上传)|附件上传失败/.test(
+          (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').replace(/\s+/g, ' ').trim()
+        )).length
+      if (uploadFailureBaselineReady && visibleUploadRetries > baselineUploadFailureCount) {
+        return {
+          ok: false,
+          reason: '豆包页面显示图片上传失败',
+          results: [{ ok: false, count: files.length }],
+          diagnostics: {
+            elapsedMs: Date.now() - startedAt,
+            fileCount: files.length,
+            inputFileCount: input.files?.length ?? 0,
+            lastPendingText: lastPendingText || null,
+            uploadRetryVisible: true
+          }
+        }
+      }
+      const networkObservations = window.__qfNetworkObservations || []
+      const uploadNetworkFailure = networkObservations.find((item) =>
+        item.kind === 'upload' && item.epoch === uploadNetworkEpoch &&
+        (item.transportError === true || (typeof item.status === 'number' && item.status >= 400))
+      )
+      if (uploadNetworkFailure) {
+        return {
+          ok: false,
+          reason: '图片上传网络请求失败',
+          results: [{ ok: false, count: files.length }],
+          diagnostics: {
+            elapsedMs: Date.now() - startedAt,
+            fileCount: files.length,
+            inputFileCount: input.files?.length ?? 0,
+            lastPendingText: lastPendingText || null,
+            networkFailure: {
+              status: typeof uploadNetworkFailure.status === 'number' ? uploadNetworkFailure.status : null,
+              transportError: uploadNetworkFailure.transportError === true
+            }
+          }
+        }
+      }
       const pendingMatch = text.match(/上传中|正在上传|压缩中|处理中/)
       const pending = !!pendingMatch
       lastPendingText = pendingMatch?.[0] || ''
@@ -383,6 +433,27 @@ const appendAndSubmitTextScript = (text: string): unknown => {
 }
 
 const readPageTextScript = (): string => document.body ? document.body.innerText : ''
+
+/**
+ * 采集当前页面可见的发送/上传失败控件。只记录稳定分类和可见短文本，不依赖 CSS Modules 哈希。
+ * 调用方会与提交前 baseline 做多重集差，避免历史失败消息误伤本次生成。
+ */
+const readPageFailureSignalsScript = (): string[] => {
+  const norm = (value: string | null | undefined): string => (value || '').replace(/\s+/g, ' ').trim()
+  const signals: string[] = []
+  const candidates = [...document.querySelectorAll<HTMLElement>('button, [role="button"], [aria-label], [title]')]
+    .filter((el) => el.offsetParent !== null)
+  for (const el of candidates) {
+    const text = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'))
+    if (!text) continue
+    if (/^(重发|重新发送|点击重试|重试)$/.test(text) || /发送失败.{0,20}(重发|重试)|消息发送失败/.test(text)) {
+      signals.push('send-retry-visible')
+    } else if (/重新上传|上传失败.{0,20}(重试|重新上传)|附件上传失败/.test(text)) {
+      signals.push('upload-retry-visible')
+    }
+  }
+  return signals
+}
 
 // 填入 prompt：先清空编辑器（ProseMirror 可能含时长 chip），再插入干净文本，校验后回车提交
 const fillAndSubmitScript = (prompt: string): unknown => {
@@ -1200,8 +1271,23 @@ const riskProbeScript = (): unknown => {
       setRisk('verify', 'verification-required')
     }
   }
-  const grab = (url: string, p: Promise<Response>): void => {
+  window.__qfNetworkEpochs = { upload: 0, submit: 0 }
+  window.__qfNetworkObservations = []
+  const requestKind = (url: string): 'upload' | 'submit' | null =>
+    /upload|image\/upload|file\/upload|attachment/i.test(url)
+      ? 'upload'
+      : /chat\/completion|samantha\/chat/i.test(url)
+        ? 'submit'
+        : null
+  const requestEpoch = (kind: 'upload' | 'submit'): number => window.__qfNetworkEpochs?.[kind] ?? 0
+  const recordNetwork = (kind: 'upload' | 'submit', epoch: number, status?: number | null, transportError = false): void => {
+    const observations = window.__qfNetworkObservations || []
+    observations.push({ kind, epoch, status: status ?? null, transportError })
+    window.__qfNetworkObservations = observations.slice(-30)
+  }
+  const grab = (url: string, p: Promise<Response>, kind: 'upload' | 'submit', epoch: number): void => {
     p.then((resp) => {
+      recordNetwork(kind, epoch, resp?.status ?? null, false)
       try {
         if (!resp || !resp.body || !resp.clone || !resp.body.getReader) return
         const clone = resp.clone()
@@ -1223,7 +1309,9 @@ const riskProbeScript = (): unknown => {
         }
         pump()
       } catch {}
-    }).catch(() => {})
+    }).catch(() => {
+      recordNetwork(kind, epoch, null, true)
+    })
   }
   const origFetch = window.fetch
   if (origFetch && !window.__qfFetchHooked) {
@@ -1232,8 +1320,10 @@ const riskProbeScript = (): unknown => {
       try {
         u = typeof args[0] === 'string' ? (args[0] as string) : ((args[0] as { url?: string })?.url || '')
       } catch {}
+      const kind = requestKind(u)
+      const epoch = kind ? requestEpoch(kind) : 0
       const p = origFetch.apply(this, args as [RequestInfo | URL, RequestInit?])
-      if (/chat\/completion|samantha\/chat/.test(u)) grab(u, p)
+      if (kind) grab(u, p, kind, epoch)
       return p
     }
     window.__qfFetchHooked = true
@@ -1247,12 +1337,20 @@ const riskProbeScript = (): unknown => {
     }
     XMLHttpRequest.prototype.send = function (...args: unknown[]): void {
       const x = this as unknown as XMLHttpRequest & { __qfUrl?: string }
-      if (/chat\/completion|samantha\/chat/.test(x.__qfUrl || '')) {
+      const kind = requestKind(x.__qfUrl || '')
+      const epoch = kind ? requestEpoch(kind) : 0
+      if (kind) {
+        // 与页面上传检测的 30 秒上限一致；尊重页面已有的更严格非零超时。
+        if (x.timeout === 0) x.timeout = 30000
         x.addEventListener('load', () => {
+          recordNetwork(kind, epoch, x.status || null, false)
           try {
-            analyze(x.responseText || '')
+            if (kind === 'submit') analyze(x.responseText || '')
           } catch {}
         })
+        x.addEventListener('error', () => recordNetwork(kind, epoch, null, true))
+        x.addEventListener('abort', () => recordNetwork(kind, epoch, null, true))
+        x.addEventListener('timeout', () => recordNetwork(kind, epoch, null, true))
       }
       return origSend.apply(this, args as [Document | XMLHttpRequestBodyInit | null | undefined])
     }
@@ -1306,6 +1404,36 @@ const readRiskScript = (): unknown => {
     type = 'none'
   }
   return { type, detail: w.detail || null, domVerify, disclaimer }
+}
+
+async function beginDoubaoNetworkOperation(win: BrowserWindow, kind: 'upload' | 'submit'): Promise<number> {
+  return await win.webContents.executeJavaScript(
+    `(() => {
+      const epochs = window.__qfNetworkEpochs || { upload: 0, submit: 0 };
+      epochs[${JSON.stringify(kind)}] = (epochs[${JSON.stringify(kind)}] || 0) + 1;
+      window.__qfNetworkEpochs = epochs;
+      return epochs[${JSON.stringify(kind)}];
+    })()`,
+    true
+  ) as number
+}
+
+async function readDoubaoNetworkFailures(
+  win: BrowserWindow,
+  kind: 'upload' | 'submit',
+  epoch: number
+): Promise<DoubaoNetworkFailure[]> {
+  try {
+    const observations = await win.webContents.executeJavaScript('window.__qfNetworkObservations || []', true) as Array<{
+      kind: 'upload' | 'submit'
+      epoch: number
+      status?: number | null
+      transportError?: boolean
+    }>
+    return summarizeDoubaoNetworkFailures(observations, { kind, epoch })
+  } catch {
+    return []
+  }
 }
 
 /** 读取风控状态（主进程） */
@@ -1362,8 +1490,12 @@ async function injectCookies(cookies: ProviderCookie[], partition: string): Prom
   return injected
 }
 
+const openDoubaoWindows = new Map<string, BrowserWindow>()
+const doubaoGenerationStarting = new Set<string>()
+
 async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Promise<DoubaoGenerateResult> {
   const partition = options.keyId ? `persist:qf-p:doubao:${options.keyId}` : PARTITION
+  const winKey = options.keyId ?? PARTITION
   const attempts: Array<{ providerId: string; ok: boolean; errorMessage?: string }> = []
   const trace = (event: string, data?: unknown): void => {
     logGeneration(`doubao-${event}`, { accountId: options.keyId ?? null, partition, data })
@@ -1710,11 +1842,13 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
     const aborted = abortIfCancelled()
     if (aborted) return aborted
   }
-  // 提交前记录页面已有视频，生成后只提取本次新增的视频，避免正常生成误取历史视频。
-  // 读取失败不阻止提交；此时不自动认领结果，窗口保留给既有人工兜底处理。
+  // 提交前分别记录页面已有视频和已有失败控件。两类 baseline 独立采集，避免一类读取失败污染另一类判断。
+  // 视频 baseline 失败不阻止提交；此时不自动认领结果，窗口保留给既有人工兜底处理。
   const baseline = new Set<string>()
   let baselineReady = false
   let preserveWindowVisible = false
+  let failureSignalBaseline: string[] = []
+  let failureSignalBaselineReady = false
   try {
     const baselineOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript('(' + extractResultScript.toString() + ')()', true), windowClosed)
     if (!('value' in baselineOperation)) return failUserClosed()
@@ -1734,6 +1868,18 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
       message: '未能读取提交前的视频记录，将继续提交并保留窗口，不自动认领视频'
     })
   }
+  try {
+    const failureBaselineOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript(
+      '(' + readPageFailureSignalsScript.toString() + ')()',
+      true
+    ), windowClosed)
+    if (!('value' in failureBaselineOperation)) return failUserClosed()
+    failureSignalBaseline = Array.isArray(failureBaselineOperation.value) ? failureBaselineOperation.value as string[] : []
+    failureSignalBaselineReady = true
+    trace('failure-baseline-captured', { ready: true, existingFailureSignalCount: failureSignalBaseline.length })
+  } catch (e) {
+    trace('failure-baseline-captured', { ready: false, error: e })
+  }
   progress(options, 'submit')
   let fillResult: { ok?: boolean; reason?: string } = {}
   const isImg2Video = options.mode === 'img2video'
@@ -1741,6 +1887,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
     closeWindow('submit-failed', { stage: 'validate-images', reason: 'missing-images' })
     return fail('图生视频需要上传图片')
   }
+  let submitNetworkEpoch = 0
   if (isImg2Video) {
     // 图生视频：先上传图片，再在保留图片的编辑器里插入 prompt 并提交
     const dataUrls: string[] = []
@@ -1753,6 +1900,8 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
       return fail('图片读取失败（路径无效或超过 10MB）')
     }
     progress(options, 'upload-images', { count: dataUrls.length })
+    const uploadFailureBaselineCount = failureSignalBaseline.filter((signal) => signal === 'upload-retry-visible').length
+    const uploadNetworkEpoch = await beginDoubaoNetworkOperation(win, 'upload')
     let uploadOk = false
     let uploadDetail: unknown = null
     let uploadCancelled = false
@@ -1760,7 +1909,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
       await win.webContents.executeJavaScript('window.__qfUploadCancel = false', true)
       let uploadSettled = false
       const uploadPromise = win.webContents.executeJavaScript(
-        '(' + uploadImagesScript.toString() + ')(' + JSON.stringify(dataUrls) + ')',
+        '(' + uploadImagesScript.toString() + ')(' + JSON.stringify(dataUrls) + ',' + failureSignalBaselineReady + ',' + uploadFailureBaselineCount + ',' + uploadNetworkEpoch + ')',
         true
       )
       const abortUploadPromise = (async () => {
@@ -1791,10 +1940,36 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
       closeWindow('cancelled', uploadDetail)
       return abortNow()
     }
+    const uploadNetworkFailures = await readDoubaoNetworkFailures(win, 'upload', uploadNetworkEpoch)
+    if (uploadNetworkFailures.length > 0) {
+      trace('upload-network-failed', { networkFailures: uploadNetworkFailures })
+      closeWindow('upload-check-failed', { uploadDetail, networkFailures: uploadNetworkFailures })
+      return fail('图片上传网络请求失败，窗口已保留，请检查豆包页面和网络后重试')
+    }
     if (!uploadOk) {
-      closeWindow('upload-check-failed', uploadDetail)
+      closeWindow('upload-check-failed', { uploadDetail, networkFailures: uploadNetworkFailures })
       return fail('图片上传失败（豆包界面未确认图片上传完成），窗口已保留，请检查豆包页面后重试')
     }
+    if (failureSignalBaselineReady) {
+      try {
+        const uploadFailureSignalsOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript(
+          '(' + readPageFailureSignalsScript.toString() + ')()',
+          true
+        ), windowClosed)
+        if (!('value' in uploadFailureSignalsOperation)) return failUserClosed()
+        const uploadFailureSignals = Array.isArray(uploadFailureSignalsOperation.value) ? uploadFailureSignalsOperation.value as string[] : []
+        const newUploadFailure = findNewDoubaoFailureSignal(failureSignalBaseline, uploadFailureSignals)
+        if (newUploadFailure === 'upload-retry-visible') {
+          trace('upload-page-failed', { signal: newUploadFailure })
+          closeWindow('upload-check-failed', { signal: newUploadFailure })
+          return fail('豆包页面显示图片上传失败，窗口已保留，请检查后重试')
+        }
+      } catch (e) {
+        if (userClosed) return failUserClosed()
+        trace('upload-failure-check-error', { error: e })
+      }
+    }
+    submitNetworkEpoch = await beginDoubaoNetworkOperation(win, 'submit')
     progress(options, 'submit-img2video')
     trace('submit-start', { mode: 'img2video' })
     try {
@@ -1808,6 +1983,7 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
       fillResult = { ok: false, reason: e instanceof Error ? e.message : String(e) }
     }
   } else {
+    submitNetworkEpoch = await beginDoubaoNetworkOperation(win, 'submit')
     trace('submit-start', { mode: 'text2video' })
     try {
       const submitOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript(
@@ -1824,6 +2000,12 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   if (!fillResult.ok) {
     closeWindow('submit-failed', fillResult)
     return fail(fillResult.reason || '提交失败，窗口已保留供检查')
+  }
+  const immediateSubmitFailures = await readDoubaoNetworkFailures(win, 'submit', submitNetworkEpoch)
+  if (immediateSubmitFailures.length > 0) {
+    trace('submit-network-failed', { networkFailures: immediateSubmitFailures })
+    closeWindow('submit-failed', { stage: 'submit-network-failed', networkFailures: immediateSubmitFailures })
+    return fail('豆包提交网络请求失败，窗口已保留，请在原窗口重发或关闭后重试')
   }
   // 脚本执行期间用户点了停止：即使脚本已跑完，也按中断处理，不再继续（杜绝「点了停止还在生成」）
   {
@@ -1930,6 +2112,28 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
       closeWindow('blocked', { stage: 'waiting-blocked' })
       return failBlocked(r.blockedText)
     }
+    // 豆包可能先接收 Enter，再异步把消息/附件标成发送失败并显示「重发」。
+    // 只比较提交前后的失败信号计数，避免历史失败消息误伤本次生成。
+    try {
+      const failureSignalsOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript(
+        '(' + readPageFailureSignalsScript.toString() + ')()',
+        true
+      ), windowClosed)
+      if (!('value' in failureSignalsOperation)) return failUserClosed()
+      const currentFailureSignals = Array.isArray(failureSignalsOperation.value) ? failureSignalsOperation.value as string[] : []
+      const newFailureSignal = failureSignalBaselineReady
+        ? findNewDoubaoFailureSignal(failureSignalBaseline, currentFailureSignals)
+        : null
+      const submitNetworkFailures = await readDoubaoNetworkFailures(win, 'submit', submitNetworkEpoch)
+      if (newFailureSignal || submitNetworkFailures.length > 0) {
+        trace('page-send-failed', { signal: newFailureSignal, networkFailures: submitNetworkFailures })
+        closeWindow('submit-failed', { stage: 'page-send-failed', signal: newFailureSignal, networkFailures: submitNetworkFailures })
+        return fail('豆包页面显示本次消息发送失败，窗口已保留，请在原窗口重发或关闭后重试')
+      }
+    } catch (e) {
+      if (userClosed) return failUserClosed()
+      trace('page-send-failure-check-error', { error: e })
+    }
     // 豆包在主提示词提交后可能要求二次确认。单段显示原窗口供人工修改/确认；批量才自动追加回复。
     if (!confirmReplied) {
       let needConfirm = false
@@ -2013,11 +2217,34 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
 }
 
 export async function runDoubaoGeneration(options: DoubaoGenerateOptions): Promise<DoubaoGenerateResult> {
+  const partition = options.keyId ? `persist:qf-p:doubao:${options.keyId}` : PARTITION
+  const winKey = options.keyId ?? PARTITION
+  const existing = openDoubaoWindows.get(winKey)
+  const hasExisting = !!existing && !existing.isDestroyed()
+  if (!shouldStartDoubaoManagedWindow(hasExisting, doubaoGenerationStarting.has(winKey))) {
+    try {
+      existing?.show()
+      existing?.focus()
+    } catch {}
+    logGeneration('doubao-window-reused-blocked', {
+      accountId: options.keyId ?? null,
+      partition,
+      hasExisting,
+      generationStarting: doubaoGenerationStarting.has(winKey)
+    })
+    return {
+      ok: false,
+      providerId: 'doubao',
+      error: '该账号已有豆包窗口待处理，请在原窗口处理或关闭后再重试',
+      attempts: [{ providerId: 'doubao', ok: false, errorMessage: '该账号已有豆包窗口待处理' }]
+    }
+  }
+
+  doubaoGenerationStarting.add(winKey)
   try {
     return await runDoubaoGenerationInternal(options)
   } catch (error) {
-    const partition = options.keyId ? `persist:qf-p:doubao:${options.keyId}` : PARTITION
-    const retained = openDoubaoWindows.get(options.keyId ?? PARTITION)
+    const retained = openDoubaoWindows.get(winKey)
     try {
       retained?.show()
       retained?.focus()
@@ -2029,12 +2256,12 @@ export async function runDoubaoGeneration(options: DoubaoGenerateOptions): Promi
       error: '豆包生成发生未处理异常，窗口已保留，请检查后重试',
       attempts: [{ providerId: 'doubao', ok: false, errorMessage: '豆包生成发生未处理异常' }]
     }
+  } finally {
+    doubaoGenerationStarting.delete(winKey)
   }
 }
 
 /** 打开的豆包窗口引用（keyId → 窗口），供失败现场与「下载最新」共用。 */
-const openDoubaoWindows = new Map<string, BrowserWindow>()
-
 function retainGenerationWindow(keyId: string | undefined, generationWindow: BrowserWindow): void {
   const winKey = keyId ?? PARTITION
   openDoubaoWindows.set(winKey, generationWindow)
@@ -2052,6 +2279,9 @@ export function openDoubaoPage(keyId?: string): { ok: boolean; error?: string } 
     existing.show()
     existing.focus()
     return { ok: true }
+  }
+  if (doubaoGenerationStarting.has(winKey)) {
+    return { ok: false, error: '该账号的豆包生成窗口正在打开，请稍后再试' }
   }
   const win = new BrowserWindow({
     show: true,

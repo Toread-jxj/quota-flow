@@ -343,7 +343,6 @@ export function durationOptions(
   provider: string,
   model: string,
   mode: string,
-  vip: boolean,
   supportedDurations: number[] = DEFAULT_SUPPORTED_DURATIONS
 ): DurationOption[] {
   const allowed = new Set(supportedDurations)
@@ -367,10 +366,6 @@ export function durationOptions(
     durations[0] = { value: 5, label: '5 秒' }
   }
   const d15 = durations.find((d) => d.value === 15)
-  if (provider === 'doubao' && d15 && !vip) {
-    d15.label = '15 秒（仅 VIP）'
-    d15.disabled = true
-  }
   if ((provider === 'qwen' || provider === 'qwenwan') && d15) {
     if (model === '万相 2.6' && mode === 'multi_ref') {
       d15.label = '15 秒（多参考不支持）'

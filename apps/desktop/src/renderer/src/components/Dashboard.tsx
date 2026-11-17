@@ -34,8 +34,6 @@ import type { ProviderCaps, ProviderCapsMap } from '../hooks/useProviderCaps'
 import { imageContentType, prepareReferenceImage } from '../utils/uploadImage'
 import AudioCropModal from './AudioCropModal'
 
-const VIP = false
-
 /** 需要通过公网上传（本地图转公网 URL）才能做图生/参考的 API 型厂商（历史图生记录重新生成时需重传本地图取新 URL） */
 const API_IMAGE_PROVIDERS = ['zhipu', 'volcengine', 'bailian', 'tokenhub']
 
@@ -549,7 +547,7 @@ export default function Dashboard({
     if (provider === 'tokenhub') return tkhModelDurations(model)
     return providerDurations.get(provider) ?? DEFAULT_SUPPORTED_DURATIONS
   }, [provider, model, providerDurations])
-  const durations = durationOptions(provider, model, mode, VIP, selectedDurations)
+  const durations = durationOptions(provider, model, mode, selectedDurations)
   const modeOptions = useMemo(
     () => visibleModeOptions(provider, model, features, caps),
     [provider, model, features, caps]

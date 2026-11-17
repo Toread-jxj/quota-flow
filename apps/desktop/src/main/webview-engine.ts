@@ -18,6 +18,7 @@ import { pickNewVideoResult } from './video-result-policy'
 import { findNewDoubaoFailureSignal, hasNewDoubaoFailureCount, shouldStartDoubaoManagedWindow } from './doubao-page-failure-policy'
 import { summarizeDoubaoNetworkFailures, type DoubaoNetworkFailure } from './doubao-network-diagnostics'
 import { hasConfirmRequestAfterPrompt } from './confirm-request-policy'
+import { advanceDoubaoUploadReadiness, isDoubaoUploadReadyAfterGrace } from './doubao-upload-readiness-policy'
 import { readFileSync } from 'node:fs'
 
 declare global {
@@ -181,7 +182,9 @@ const uploadImagesScript = (
   dataUrls: string[],
   uploadFailureBaselineReady = false,
   baselineUploadFailureCount = 0,
-  uploadNetworkEpoch = 0
+  uploadNetworkEpoch = 0,
+  advanceReadiness: typeof advanceDoubaoUploadReadiness,
+  readyAfterGrace: typeof isDoubaoUploadReadyAfterGrace
 ): unknown => {
   const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
   const findInput = (): HTMLInputElement | null => {
@@ -230,6 +233,7 @@ const uploadImagesScript = (
     // 恢复已稳定版本的上传等待策略：至少等待约 9.75 秒，上传文案消失后再等 2 秒。
     // 不再使用 a49d200 引入的 1.5 秒快速稳定判定，避免页面短暂空窗导致误判。
     let done = false
+    let stableClearSamples = 0
     let lastPendingText = ''
     const startedAt = Date.now()
     for (let w = 0; w < 40; w++) {
@@ -282,10 +286,26 @@ const uploadImagesScript = (
       const pendingMatch = text.match(/上传中|正在上传|压缩中|处理中/)
       const pending = !!pendingMatch
       lastPendingText = pendingMatch?.[0] || ''
-      if (w > 12 && !pending) {
+      const readiness = advanceReadiness(
+        { stableClearSamples },
+        {
+          minimumWaitElapsed: w > 12,
+          pending,
+          acceptedFileCount: input.files?.length ?? 0,
+          expectedFileCount: files.length
+        }
+      )
+      stableClearSamples = readiness.stableClearSamples
+      if (readiness.shouldFinalCheck) {
         await sleep(2000)
-        done = true
-        break
+        const afterText = document.body ? document.body.innerText : ''
+        const stillPending = /上传中|正在上传|压缩中|处理中/.test(afterText)
+        const afterFileCount = input.files?.length ?? 0
+        if (readyAfterGrace(stillPending, afterFileCount, files.length)) {
+          done = true
+          break
+        }
+        stableClearSamples = 0
       }
     }
     results.push({ ok: done, count: files.length })
@@ -1909,7 +1929,13 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
       await win.webContents.executeJavaScript('window.__qfUploadCancel = false', true)
       let uploadSettled = false
       const uploadPromise = win.webContents.executeJavaScript(
-        '(' + uploadImagesScript.toString() + ')(' + JSON.stringify(dataUrls) + ',' + failureSignalBaselineReady + ',' + uploadFailureBaselineCount + ',' + uploadNetworkEpoch + ')',
+        '(' + uploadImagesScript.toString() + ')(' +
+          JSON.stringify(dataUrls) + ',' +
+          failureSignalBaselineReady + ',' +
+          uploadFailureBaselineCount + ',' +
+          uploadNetworkEpoch + ',' +
+          advanceDoubaoUploadReadiness.toString() + ',' +
+          isDoubaoUploadReadyAfterGrace.toString() + ')',
         true
       )
       const abortUploadPromise = (async () => {

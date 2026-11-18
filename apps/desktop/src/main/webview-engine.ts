@@ -15,7 +15,7 @@ import {
   type DoubaoWindowTerminalReason
 } from './webview-lifecycle-policy'
 import { pickNewVideoResult } from './video-result-policy'
-import { findNewDoubaoFailureSignal, hasNewDoubaoFailureCount, shouldStartDoubaoManagedWindow } from './doubao-page-failure-policy'
+import { decideDoubaoChildWindow, findNewDoubaoFailureSignal, hasNewDoubaoFailureCount, shouldStartDoubaoManagedWindow } from './doubao-page-failure-policy'
 import { summarizeDoubaoNetworkFailures, type DoubaoNetworkFailure } from './doubao-network-diagnostics'
 import { hasConfirmRequestAfterPrompt } from './confirm-request-policy'
 import { advanceDoubaoUploadReadiness, isDoubaoUploadReadyAfterGrace } from './doubao-upload-readiness-policy'
@@ -1360,8 +1360,7 @@ const riskProbeScript = (): unknown => {
       const kind = requestKind(x.__qfUrl || '')
       const epoch = kind ? requestEpoch(kind) : 0
       if (kind) {
-        // 与页面上传检测的 30 秒上限一致；尊重页面已有的更严格非零超时。
-        if (x.timeout === 0) x.timeout = 30000
+        // 只观察网页自身的请求结果，不修改豆包原有超时策略；慢网络/代理环境由页面自行决定生命周期。
         x.addEventListener('load', () => {
           recordNetwork(kind, epoch, x.status || null, false)
           try {
@@ -1621,8 +1620,20 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
   // 候选 B：webContents 也统一 UA（与登录/校验一致）
   win.webContents.setUserAgent(UA)
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http')) return { action: 'allow', overrideBrowserWindowOptions: { width: 560, height: 720 } }
-    return { action: 'deny' }
+    const decision = decideDoubaoChildWindow(url)
+    if (decision === 'focus-main') {
+      try {
+        win.show()
+        win.focus()
+      } catch {}
+      trace('child-window-blocked', { reason: 'doubao-main-page' })
+      return { action: 'deny' }
+    }
+    if (decision === 'deny') {
+      trace('child-window-blocked', { reason: 'invalid-protocol' })
+      return { action: 'deny' }
+    }
+    return { action: 'allow', overrideBrowserWindowOptions: { width: 560, height: 720 } }
   })
 
   let loadError: { code: number; desc: string; url: string } | null = null
@@ -2325,8 +2336,28 @@ export function openDoubaoPage(keyId?: string): { ok: boolean; error?: string } 
   })
   win.webContents.setUserAgent(UA)
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http')) return { action: 'allow', overrideBrowserWindowOptions: { width: 560, height: 720 } }
-    return { action: 'deny' }
+    const decision = decideDoubaoChildWindow(url)
+    if (decision === 'focus-main') {
+      try {
+        win.show()
+        win.focus()
+      } catch {}
+      logGeneration('doubao-child-window-blocked', {
+        accountId: keyId ?? null,
+        partition,
+        reason: 'doubao-main-page'
+      })
+      return { action: 'deny' }
+    }
+    if (decision === 'deny') {
+      logGeneration('doubao-child-window-blocked', {
+        accountId: keyId ?? null,
+        partition,
+        reason: 'invalid-protocol'
+      })
+      return { action: 'deny' }
+    }
+    return { action: 'allow', overrideBrowserWindowOptions: { width: 560, height: 720 } }
   })
   openDoubaoWindows.set(winKey, win)
   win.on('closed', () => {

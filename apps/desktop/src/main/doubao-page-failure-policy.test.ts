@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   findNewDoubaoFailureSignal,
   hasNewDoubaoFailureCount,
+  decideDoubaoChildWindow,
   shouldStartDoubaoManagedWindow
 } from './doubao-page-failure-policy'
 
@@ -45,5 +46,30 @@ describe('shouldStartDoubaoManagedWindow', () => {
 
   it('该账号没有窗口且没有启动中的生成时允许创建', () => {
     expect(shouldStartDoubaoManagedWindow(false, false)).toBe(true)
+  })
+})
+
+describe('decideDoubaoChildWindow', () => {
+  it('豆包聊天页不打开第二个主页面，并要求聚焦原窗口', () => {
+    expect(decideDoubaoChildWindow('https://www.doubao.com/chat/123')).toBe('focus-main')
+    expect(decideDoubaoChildWindow('https://doubao.com/chat?x=1')).toBe('focus-main')
+  })
+
+  it('继续允许非豆包的 http/https 登录或验证窗口', () => {
+    expect(decideDoubaoChildWindow('https://passport.example.com/verify')).toBe('allow')
+    expect(decideDoubaoChildWindow('https://passport.doubao.com/verify')).toBe('allow')
+    expect(decideDoubaoChildWindow('http://passport.example.com/login')).toBe('allow')
+  })
+
+  it('相似域名和非聊天路径不会被误判为豆包主页面', () => {
+    expect(decideDoubaoChildWindow('https://evil-doubao.com/chat')).toBe('allow')
+    expect(decideDoubaoChildWindow('https://doubao.com.evil.example/chat')).toBe('allow')
+    expect(decideDoubaoChildWindow('https://www.doubao.com/chatting')).toBe('allow')
+  })
+
+  it('拒绝非 http/https 协议，但不要求显示原窗口', () => {
+    expect(decideDoubaoChildWindow('file:///tmp/test')).toBe('deny')
+    expect(decideDoubaoChildWindow('javascript:alert(1)')).toBe('deny')
+    expect(decideDoubaoChildWindow('about:blank')).toBe('deny')
   })
 })

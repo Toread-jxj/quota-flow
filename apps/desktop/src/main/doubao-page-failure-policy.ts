@@ -28,3 +28,19 @@ export function shouldStartDoubaoManagedWindow(
 ): boolean {
   return !hasExistingWindow && !generationStarting
 }
+
+export type DoubaoChildWindowDecision = 'allow' | 'focus-main' | 'deny'
+
+/** 豆包主窗口不得再弹出第二个豆包聊天主页面；非豆包 http(s) 登录/验证窗口维持现有放行。 */
+export function decideDoubaoChildWindow(url: string): DoubaoChildWindowDecision {
+  try {
+    const target = new URL(url)
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') return 'deny'
+    const host = target.hostname.toLowerCase()
+    const isDoubaoHost = host === 'doubao.com' || host.endsWith('.doubao.com')
+    if (isDoubaoHost && /^\/chat(?:\/|$)/.test(target.pathname)) return 'focus-main'
+    return 'allow'
+  } catch {
+    return 'deny'
+  }
+}

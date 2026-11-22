@@ -19,6 +19,7 @@ import { decideDoubaoChildWindow, findNewDoubaoFailureSignal, hasNewDoubaoFailur
 import { summarizeDoubaoNetworkFailures, type DoubaoNetworkFailure } from './doubao-network-diagnostics'
 import { hasConfirmRequestAfterPrompt } from './confirm-request-policy'
 import { advanceDoubaoUploadReadiness, isDoubaoUploadReadyAfterGrace } from './doubao-upload-readiness-policy'
+import { decideDoubaoPageReadiness, type DoubaoPageReadinessSnapshot } from './doubao-page-readiness-policy'
 import { readFileSync } from 'node:fs'
 
 declare global {
@@ -130,11 +131,14 @@ const inspectScript = (): unknown => {
   const input = [...document.querySelectorAll('textarea, [contenteditable="true"], [contenteditable="plaintext-only"], [role="textbox"]')].find(
     (el) => (el as HTMLElement).offsetParent !== null
   ) || null
-  const btns = [...document.querySelectorAll('button, [role="button"]')]
+  const btns = [...document.querySelectorAll('button, [role="button"], [role="tab"]')]
     .filter((b) => (b as HTMLElement).offsetParent !== null)
-    .map((b) => norm((b as HTMLElement).textContent || ''))
+    .map((b) =>
+      norm((b as HTMLElement).textContent || '') ||
+      norm(b.getAttribute('aria-label') || '') ||
+      norm(b.getAttribute('title') || '')
+    )
     .filter(Boolean)
-    .slice(0, 20)
 
   // 登录检测：豆包导航栏始终有「登录」按钮，不能单靠它判断
   // 真正未登录的特征：
@@ -147,12 +151,16 @@ const inspectScript = (): unknown => {
     document.querySelector('img[class*="avatar" i], img[src*="avatar" i]')
   )
   const hasLogin = hasLoginWall || !hasUserInfo
+  const videoEntryFound = btns.some((t) =>
+    t === '视频生成' || (t.includes('视频生成') && !/额度|计算|说明|提示|帮助/.test(t))
+  )
 
   return {
     url: location.href,
     title: document.title,
     inputFound: !!input,
     inputTag: input ? input.tagName.toLowerCase() : '',
+    videoEntryFound,
     hasLogin,
     hasLoginWall,
     hasUserInfo,
@@ -1708,22 +1716,37 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
     }
   }
 
-  let inspect: { inputFound?: boolean; inputTag?: string; hasLogin?: boolean; hasLoginWall?: boolean; hasUserInfo?: boolean; url?: string } = {}
-  try {
-    const inspectOperation = await raceDoubaoOperationWithClose(win.webContents.executeJavaScript('(' + inspectScript.toString() + ')()', true), windowClosed)
-    if (!('value' in inspectOperation)) return failUserClosed()
-    inspect = inspectOperation.value as typeof inspect
-  } catch {
-    if (userClosed) return failUserClosed()
-    inspect = {}
+  type PageInspect = DoubaoPageReadinessSnapshot & {
+    inputTag?: string
+    hasLogin?: boolean
+    url?: string
   }
-  if (loadError || !inspect.inputFound) {
-    trace('page-inspect-failed', { loadError, inspect })
+  let inspect: PageInspect = {}
+  let readiness = decideDoubaoPageReadiness(inspect, false)
+  const pageReadyDeadline = Date.now() + 15000
+  progress(options, 'wait-page-ready')
+  while (!loadError) {
+    try {
+      const inspectOperation = await raceDoubaoOperationWithClose(
+        win.webContents.executeJavaScript('(' + inspectScript.toString() + ')()', true),
+        windowClosed
+      )
+      if (!('value' in inspectOperation)) return failUserClosed()
+      inspect = inspectOperation.value as PageInspect
+    } catch {
+      if (userClosed) return failUserClosed()
+    }
+    readiness = decideDoubaoPageReadiness(inspect, Date.now() >= pageReadyDeadline)
+    if (readiness !== 'wait') break
+    if (await waitOrAbort(1000)) return abortNow()
+  }
+  if (loadError || readiness === 'timeout') {
+    trace('page-inspect-failed', { loadError, inspect, readiness })
     if (loadError) closeWindow('timeout', { stage: 'page-load', loadError })
-    else closeWindow('submit-failed', { stage: 'page-inspect', inspect })
-    return fail(loadError ? `页面加载失败 (${loadError.code}: ${loadError.desc})` : '豆包页面未找到输入框（可能未登录或页面结构变化）')
+    else closeWindow('submit-failed', { stage: 'page-inspect', inspect, readiness })
+    return fail(loadError ? `页面加载失败 (${loadError.code}: ${loadError.desc})` : '豆包页面未就绪（未找到输入框或视频生成入口），窗口已保留')
   }
-  if (inspect.hasLogin) {
+  if (readiness === 'login-required') {
     closeWindow('account-auth-failed', { stage: 'login-check', inspect })
     return fail(
       '豆包账号未登录（cookie 可能已失效），请在厂商页重新登录后重试' +

@@ -1424,6 +1424,7 @@ async function healthCheck(
     })
 
     win.webContents.on('did-finish-load', () => {
+      if (win.isDestroyed() || win.webContents.isDestroyed()) return
       finalUrl = win.webContents.getURL()
       if (statusCode === null) settle('unknown', '未捕获响应状态')
       else if (statusCode === 200) settle('healthy')

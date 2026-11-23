@@ -33,6 +33,7 @@ import {
   shouldUsePersistedPartitionAfterCredentialFailure
 } from './account-retry-policy'
 import { logGeneration } from './diagnostics'
+import { resolveDownloadRedirect } from './download-policy'
 
 export interface GenerateInput {
   supabaseUrl: string
@@ -223,6 +224,7 @@ export function downloadVideo(
     const out = createWriteStream(tmp)
     let size = 0
     let settled = false
+    let responseEnded = false
     const finish = (ok: boolean, path: string | null, reason?: string): void => {
       if (settled) return
       settled = true
@@ -238,9 +240,11 @@ export function downloadVideo(
       return
     }
 
-    const req = httpsGet(
-      url,
-      {
+    let req
+    try {
+      req = httpsGet(
+        url,
+        {
         headers: {
           'User-Agent': UA,
           Accept: '*/*',
@@ -257,7 +261,14 @@ export function downloadVideo(
       (res) => {
         if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume()
-          void downloadVideo(res.headers.location, jobId, providerId, redirects + 1, onError).then((p) => finish(!!p, p))
+          const redirect = resolveDownloadRedirect(url, res.headers.location)
+          if ('reason' in redirect) {
+            finish(false, null, redirect.reason)
+            return
+          }
+          void downloadVideo(redirect.url, jobId, providerId, redirects + 1, onError)
+            .then((p) => finish(!!p, p, p ? undefined : '重定向下载失败'))
+            .catch((e) => finish(false, null, `重定向下载异常：${errMsg(e)}`))
           return
         }
         if (!res.statusCode || res.statusCode !== 200) {
@@ -268,9 +279,25 @@ export function downloadVideo(
         res.on('data', (c: Buffer) => {
           size += c.length
         })
+        res.on('end', () => {
+          responseEnded = true
+        })
+        res.setTimeout(90000, () => {
+          res.destroy()
+          finish(false, null, '下载响应超时（90 秒）')
+        })
+        res.on('error', (e) => finish(false, null, `响应流错误：${e.message}`))
+        res.on('aborted', () => finish(false, null, '响应流被中止'))
+        res.on('close', () => {
+          if (!responseEnded) finish(false, null, '响应流提前关闭')
+        })
         res.pipe(out)
       }
-    )
+      )
+    } catch (e) {
+      finish(false, null, `创建下载请求失败：${errMsg(e)}`)
+      return
+    }
     req.on('error', (e) => finish(false, null, `网络错误：${e.message}`))
     req.setTimeout(90000, () => {
       req.destroy()

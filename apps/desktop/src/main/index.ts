@@ -832,7 +832,12 @@ app.whenReady().then(() => {
         let src = join(app.getPath('userData'), 'videos', `${result.jobId}.mp4`)
         if (!existsSync(src) && result.remoteUrl) {
           // 补下载：runGenerate 内下载失败（如 Node 不走系统代理），用 remoteUrl 重试
-          const retried = await downloadVideo(result.remoteUrl, result.jobId, 'doubao')
+          logGeneration('storyboard-download-start', { index: params.index, jobId: result.jobId, accountId: result.accountId ?? null, hasRemoteUrl: true })
+          let retryError = ''
+          const retried = await downloadVideo(result.remoteUrl, result.jobId, 'doubao', 0, (reason) => {
+            retryError = reason
+          })
+          logGeneration('storyboard-download-result', { index: params.index, jobId: result.jobId, accountId: result.accountId ?? null, ok: !!retried, error: retryError || null })
           if (retried) src = retried
         }
         if (!existsSync(src)) {

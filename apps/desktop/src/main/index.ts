@@ -821,7 +821,21 @@ app.whenReady().then(() => {
       logGeneration('storyboard-generate-start', { index: params.index, durationSec: params.gen.durationSec, preferredAccountId: params.gen.preferredAccountId ?? null, mode: params.gen.mode })
       let generationResult: Awaited<ReturnType<typeof runGenerate>> | null = null
       try {
-        generationResult = await runGenerate(params.gen, () => {}, undefined, undefined)
+        generationResult = await runGenerate(params.gen, (event) => {
+          if (event.stage !== 'select-account') return
+          const accountId = event.data && typeof event.data === 'object'
+            ? (event.data as { accountId?: unknown }).accountId
+            : null
+          if (typeof accountId !== 'string' || !accountId) return
+          const saved = writeStoryboardProgress(params.batchDir, params.index, {
+            jobId: event.jobId,
+            accountId,
+            status: 'running'
+          })
+          if (!saved.ok) {
+            throw new Error(`选中账号后进度写入失败: ${saved.error || '未知错误'}`)
+          }
+        }, undefined, undefined)
         const result = generationResult
         logGeneration('storyboard-generate-result', { index: params.index, ok: result.ok, jobId: result.jobId ?? null, error: result.error ?? null, accountId: result.accountId ?? null, hasRemoteUrl: !!result.remoteUrl })
         if (!result.ok || !result.jobId) {
@@ -854,9 +868,10 @@ app.whenReady().then(() => {
         return { ok: true, videoPath: dst, jobId: result.jobId }
       } catch (e) {
         logGeneration('storyboard-generate-exception', { index: params.index, error: e })
-        const accountId = generationResult?.accountId ?? params.gen.preferredAccountId ?? null
-        const jobId = generationResult?.jobId ?? null
-        const remoteUrl = generationResult?.remoteUrl ?? null
+        const currentProgress = readStoryboardProgress(params.batchDir)[String(params.index)] || {}
+        const accountId = generationResult?.accountId ?? params.gen.preferredAccountId ?? currentProgress.accountId ?? null
+        const jobId = generationResult?.jobId ?? currentProgress.jobId ?? null
+        const remoteUrl = generationResult?.remoteUrl ?? currentProgress.remoteUrl ?? null
         const saved = writeStoryboardProgress(params.batchDir, params.index, { jobId, remoteUrl, accountId, status: 'error' })
         const error = e instanceof Error ? e.message : String(e)
         return { ok: false, error: saved.ok ? error : `${error}；进度写入失败: ${saved.error || '未知错误'}`, jobId, remoteUrl, accountId }

@@ -330,7 +330,7 @@ const uploadImagesScript = (
   })()
 }
 
-// 图生视频：不清空编辑器（保留已上传的图片 chip），光标移末尾插入 prompt 并回车提交
+// 图生视频：保留已上传图片，写入并聚焦提示词；Enter 由主进程发送真实输入事件。
 const insertPromptAndSubmitScript = (prompt: string): unknown => {
   const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
   const norm = (s: string): string => (s || '').trim()
@@ -342,21 +342,17 @@ const insertPromptAndSubmitScript = (prompt: string): unknown => {
     }
     return null
   }
-  // DOM 定位 ProseMirror 视图（不遍历 window 全局键，避免触发页面 getter 导致失响应）
   const findView = (): { state?: unknown; dispatch?: (tr: unknown) => void } | null => {
     try {
       const pm = document.querySelector<HTMLElement>('[class*="ProseMirror"], [class*="tiptap"], [contenteditable="true"]')
       const desc = pm && (pm as unknown as { pmViewDesc?: { view?: unknown } }).pmViewDesc
-      if (desc && desc.view) {
-        return desc.view as { state?: unknown; dispatch?: (tr: unknown) => void }
-      }
+      if (desc && desc.view) return desc.view as { state?: unknown; dispatch?: (tr: unknown) => void }
     } catch {}
     return null
   }
   return (async () => {
     const editor = findEditor()
     if (!editor) return { ok: false, reason: '未找到输入框' }
-    // 清理编辑器状态里的时长 chip（文本恰为 10s/5s/15s 的节点），保留已上传的图片
     try {
       const view = findView()
       if (view && view.state && view.dispatch) {
@@ -376,28 +372,22 @@ const insertPromptAndSubmitScript = (prompt: string): unknown => {
         await sleep(300)
       }
     } catch {}
-    // DOM 兜底：删除编辑器内文本恰为时长格式的节点
     try {
       for (const el of [...editor.querySelectorAll('*')]) {
-        const t = norm(el.textContent || '')
-        if (/^\d{1,2}s$/.test(t)) el.remove()
+        if (/^\d{1,2}s$/.test(norm(el.textContent || ''))) el.remove()
       }
     } catch {}
-    // 追加 prompt 并校验确实落进编辑器：图生视频会在图片 chip 后追加一段提示词，
-    // 之前没校验，插入失败仍返回 ok → 调度台误显示「排队中」但提示词根本没进输入框。
     const headCore = prompt.split(/[，,]/)[0].substring(0, 6)
     let inserted = norm(editor.innerText || editor.textContent || '').includes(headCore)
     for (let i = 0; i < 4 && !inserted; i++) {
       editor.focus()
       try {
-        const sel = window.getSelection()
-        if (sel) {
-          const range = document.createRange()
-          range.selectNodeContents(editor)
-          range.collapse(false)
-          sel.removeAllRanges()
-          sel.addRange(range)
-        }
+        const selection = window.getSelection()
+        const range = document.createRange()
+        range.selectNodeContents(editor)
+        range.collapse(false)
+        selection?.removeAllRanges()
+        selection?.addRange(range)
       } catch {}
       try {
         document.execCommand('insertText', false, prompt)
@@ -405,21 +395,11 @@ const insertPromptAndSubmitScript = (prompt: string): unknown => {
       editor.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: prompt }))
       editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }))
       await sleep(600)
-      const t = norm(editor.innerText || editor.textContent || '')
-      if (headCore.length > 0 && t.includes(headCore)) inserted = true
+      inserted = headCore.length > 0 && norm(editor.innerText || editor.textContent || '').includes(headCore)
     }
-    if (!inserted) {
-      return { ok: false, reason: '提示词未成功进入输入框，已中止以避免误报生成中' }
-    }
+    if (!inserted) return { ok: false, reason: '提示词未成功进入输入框，已中止提交' }
     editor.focus()
-    const enterOpts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }
-    editor.dispatchEvent(new KeyboardEvent('keydown', enterOpts))
-    editor.dispatchEvent(new KeyboardEvent('keypress', enterOpts))
-    editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }))
-    await sleep(1500)
-    const editorAfter = norm(editor.innerText || editor.textContent || '')
-    const sent = !editorAfter.includes(headCore)
-    return sent ? { ok: true } : { ok: false, reason: '已触发提交但页面未确认提示词发送成功' }
+    return { ok: true }
   })()
 }
 
@@ -568,16 +548,8 @@ const fillAndSubmitScript = (prompt: string): unknown => {
     if (!cleanOk) {
       return { ok: false, reason: '编辑器内容校验失败（未检测到提示词核心片段）' }
     }
-    const enterOpts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }
-    editor.dispatchEvent(new KeyboardEvent('keydown', enterOpts))
-    editor.dispatchEvent(new KeyboardEvent('keypress', enterOpts))
-    editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }))
-    await sleep(1500)
-    const editorAfter = norm(editor.innerText || editor.textContent || '')
-    const sent = !editorAfter.includes(headCore)
-    return sent
-      ? { ok: true, submitted: true }
-      : { ok: false, submitted: false, reason: '已触发提交但页面未确认提示词发送成功' }
+    editor.focus()
+    return { ok: true }
   })()
 }
 
@@ -1433,6 +1405,13 @@ const readRiskScript = (): unknown => {
   return { type, detail: w.detail || null, domVerify, disclaimer }
 }
 
+async function sendDoubaoNativeEnter(win: BrowserWindow): Promise<void> {
+  if (win.isDestroyed() || win.webContents.isDestroyed()) throw new Error('豆包窗口已关闭')
+  win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'ENTER' })
+  win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'ENTER' })
+  await sleep(300)
+}
+
 async function beginDoubaoNetworkOperation(win: BrowserWindow, kind: 'upload' | 'submit'): Promise<number> {
   return await win.webContents.executeJavaScript(
     `(() => {
@@ -2056,10 +2035,20 @@ async function runDoubaoGenerationInternal(options: DoubaoGenerateOptions): Prom
       fillResult = { ok: false, reason: e instanceof Error ? e.message : String(e) }
     }
   }
-  trace('submit-result', fillResult)
+  trace('prompt-insert-result', fillResult)
   if (!fillResult.ok) {
     closeWindow('submit-failed', fillResult)
-    return fail(fillResult.reason || '提交失败，窗口已保留供检查')
+    return fail(fillResult.reason || '提示词写入失败，窗口已保留供检查')
+  }
+  try {
+    await sendDoubaoNativeEnter(win)
+    trace('submit-result', { ok: true, input: 'native-enter' })
+  } catch (e) {
+    if (userClosed) return failUserClosed()
+    const reason = e instanceof Error ? e.message : String(e)
+    trace('submit-result', { ok: false, input: 'native-enter', reason })
+    closeWindow('submit-failed', { reason })
+    return fail('豆包原生提交失败，窗口已保留供检查')
   }
   const immediateSubmitFailures = await readDoubaoNetworkFailures(win, 'submit', submitNetworkEpoch)
   if (immediateSubmitFailures.length > 0) {

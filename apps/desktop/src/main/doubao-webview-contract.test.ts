@@ -36,4 +36,22 @@ describe('豆包网页请求与子窗口合同', () => {
     expect(inspectScriptBlock).toContain("getAttribute('title')")
     expect(inspectScriptBlock.indexOf('.slice(0, 20)')).toBe(-1)
   })
+
+  it('主提示词提交必须使用 Electron 原生 Enter，且不得用输入框清空作为成功硬门槛', () => {
+    const text = source()
+    const imgSubmitStart = text.indexOf('const insertPromptAndSubmitScript')
+    const confirmStart = text.indexOf('const appendAndSubmitTextScript', imgSubmitStart)
+    const imgSubmitBlock = text.slice(imgSubmitStart, confirmStart)
+    const textSubmitStart = text.indexOf('const fillAndSubmitScript', confirmStart)
+    const extractStart = text.indexOf('const extractResultScript', textSubmitStart)
+    const textSubmitBlock = text.slice(textSubmitStart, extractStart)
+    for (const submitBlock of [imgSubmitBlock, textSubmitBlock]) {
+      expect(submitBlock).not.toContain("new KeyboardEvent('keydown'")
+      expect(submitBlock).not.toContain('editorAfter')
+      expect(submitBlock).not.toContain("reason: '已触发提交但页面未确认提示词发送成功'")
+    }
+    expect(text).toContain("sendDoubaoNativeEnter(win)")
+    expect(text).toContain("win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'ENTER' })")
+    expect(text).toContain("win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'ENTER' })")
+  })
 })

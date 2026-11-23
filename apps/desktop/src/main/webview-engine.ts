@@ -728,8 +728,8 @@ const openDurationMenuScript = (): unknown => {
   return { ok: true, text: textOf(hit).slice(0, 40) }
 }
 
-/* 滑块手柄按一次方向键（React 状态批处理：必须一次一步 + 读值校验） */
-const pressSliderKeyScript = (dir: string): unknown => {
+/* 聚焦时长滑块手柄；方向键由主进程发送真实输入事件。 */
+const focusDurationSliderScript = (): unknown => {
   const menu =
     [...document.querySelectorAll('[role="menu"][data-state="open"]')]
       .filter((el) => (el as HTMLElement).offsetParent !== null)
@@ -741,13 +741,7 @@ const pressSliderKeyScript = (dir: string): unknown => {
     ) || null
   if (!thumb) return { ok: false, reason: '未找到时长滑块手柄' }
   ;(thumb as HTMLElement).focus()
-  const key = dir === 'left' ? 'ArrowLeft' : 'ArrowRight'
-  const keyCode = dir === 'left' ? 37 : 39
-  thumb.dispatchEvent(
-    new KeyboardEvent('keydown', { key, code: key, keyCode, which: keyCode, bubbles: true, cancelable: true })
-  )
-  thumb.dispatchEvent(new KeyboardEvent('keyup', { key, code: key, keyCode, which: keyCode, bubbles: true }))
-  return { ok: true }
+  return { ok: document.activeElement === thumb }
 }
 
 /* 关闭时长菜单：Escape + 外部 pointerdown（不做 trigger 点击，避免把已关的菜单重新打开） */
@@ -979,6 +973,13 @@ const clickModelScript = (target: string): unknown => {
 }
 
 /** 通过豆包真实 UI 设置时长（页面内 JS PointerEvent + 键盘，隐藏窗口可用，无需 CDP）。失败时调用方应终止任务。 */
+async function sendDoubaoNativeSliderKey(win: BrowserWindow, dir: 'left' | 'right'): Promise<void> {
+  if (win.isDestroyed() || win.webContents.isDestroyed()) throw new Error('豆包窗口已关闭')
+  const keyCode = dir === 'left' ? 'LEFT' : 'RIGHT'
+  win.webContents.sendInputEvent({ type: 'keyDown', keyCode })
+  win.webContents.sendInputEvent({ type: 'keyUp', keyCode })
+}
+
 async function applyDoubaoDuration(
   win: BrowserWindow,
   durationSec: number
@@ -987,8 +988,13 @@ async function applyDoubaoDuration(
     win.webContents.executeJavaScript('(' + script + ')(' + (arg !== undefined ? JSON.stringify(arg) : '') + ')', true)
   const target = durationSec === 10 ? 10 : durationSec === 15 ? 15 : 5
   const targetValue = Math.max(0, Math.min(11, target - 4))
+  const parseThumbValue = (value: unknown): number | null => {
+    if (typeof value !== 'string' || value.trim() === '') return null
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
 
-  // 1) 读取当前按钮文本，已为目标时长则跳过
+  // 1) 读取选择器状态；真实时长只认菜单内滑块 aria-valuenow。
   let state: {
     triggerText?: string
     menuOpen?: boolean
@@ -999,11 +1005,6 @@ async function applyDoubaoDuration(
   } catch {
     return { ok: false, reason: '读取时长选择器失败' }
   }
-  const curSec = Number((state.triggerText || '').match(/(\d+)\s*s/i)?.[1] || 0)
-  if (curSec === target) {
-    return { ok: true } // 已为目标时长，无需操作
-  }
-
   // 2) 打开菜单（JS PointerEvent，幂等：已开则跳过点击；重试 3 次）
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -1035,30 +1036,34 @@ async function applyDoubaoDuration(
     return { ok: false, reason: '时长菜单未打开' }
   }
 
-  // 3) 键盘逐档调值：一次一步 + 读值校验（React 状态批处理，不能连发）
-  let cur = Number(state.thumbValue ?? 6)
+  // 3) 原生键盘逐档调值：每按一步都必须读到 aria-valuenow，且恰好移动一档。
+  let cur = parseThumbValue(state.thumbValue)
+  if (cur === null) return { ok: false, reason: '无法读取时长滑块当前值' }
   for (let i = 0; i < 15 && cur !== targetValue; i++) {
-    const dir = targetValue > cur ? 'right' : 'left'
+    const dir: 'left' | 'right' = targetValue > cur ? 'right' : 'left'
+    const expected: number = cur + (dir === 'right' ? 1 : -1)
     try {
-      await exec(pressSliderKeyScript.toString(), dir)
-    } catch {}
+      const focused = (await exec(focusDurationSliderScript.toString())) as { ok?: boolean; reason?: string }
+      if (!focused.ok) return { ok: false, reason: focused.reason || '时长滑块无法聚焦' }
+      await sendDoubaoNativeSliderKey(win, dir)
+    } catch (e) {
+      return { ok: false, reason: `调整时长失败：${e instanceof Error ? e.message : String(e)}` }
+    }
     await sleep(300)
     try {
       state = (await exec(readDurationStateScript.toString())) as typeof state
-      const v = Number(state.thumbValue)
-      if (Number.isFinite(v)) cur = v
-    } catch {}
+    } catch {
+      return { ok: false, reason: '调整后无法读取时长滑块值' }
+    }
+    const next = parseThumbValue(state.thumbValue)
+    if (next === null) return { ok: false, reason: '调整后时长滑块值无效' }
+    if (next !== expected) return { ok: false, reason: `时长滑块未按预期移动（${cur} → ${next}）` }
+    cur = next
   }
 
-  // 4) 校验：thumb aria-valuenow === target-4 或按钮文本含「Ns」
-  let after: { triggerText?: string; thumbValue?: string | null } = {}
-  try {
-    after = (await exec(readDurationStateScript.toString())) as typeof after
-  } catch {}
-  const okByThumb = after.thumbValue !== null && Number(after.thumbValue) === targetValue
-  const okByText = new RegExp(target + '\\s*s', 'i').test(after.triggerText || '')
-  if (!okByThumb && !okByText) {
-    return { ok: false, reason: `时长未生效（当前按钮：${after.triggerText || '未知'}）` }
+  // 4) 最终只认滑块 aria-valuenow；按钮文案可能是自动估时，不能作为 15 秒成功证据。
+  if (cur !== targetValue) {
+    return { ok: false, reason: `时长未生效（滑块值：${cur}，目标：${targetValue}）` }
   }
 
   // 5) 关闭菜单（尽力而为；隐藏窗口下关闭动画不完成，残留 closed 内容不影响后续 fill/submit）
